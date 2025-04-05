@@ -47,103 +47,138 @@ if 'training_report' not in st.session_state:
 def parse_historic_categorized(df_raw):
     """Parsea el Gastos.csv inicial para entrenamiento."""
     try:
-        st.write("Debug: Entrando en parse_historic_categorized") # Debug
-        # Asegurar que los nombres de columna son strings antes de operar
-        df_raw.columns = [str(col).upper().strip() for col in df_raw.columns]
-        st.write(f"Debug: Columnas raw limpiadas: {df_raw.columns.tolist()}") # Debug
+        st.write("Debug (parse_historic): Iniciando parseo...")
+        if not isinstance(df_raw, pd.DataFrame):
+            st.error("Error Interno: parse_historic_categorized no recibió un DataFrame.")
+            return None
 
+        # Copiar para evitar modificar el original fuera de la función
+        df = df_raw.copy()
+
+        # --- Limpieza de Nombres de Columna ---
+        try:
+            df.columns = [str(col).upper().strip() for col in df.columns]
+            st.write(f"Debug (parse_historic): Columnas limpiadas: {df.columns.tolist()}")
+        except Exception as e_col:
+            st.error(f"Error limpiando nombres de columna: {e_col}")
+            return None
+
+        # --- Verificación de Columnas Requeridas ---
         required = ['CONCEPTO', 'CATEGORÍA', 'SUBCATEGORIA', 'IMPORTE', 'AÑO', 'MES', 'DIA']
-        # Asegurarse que COMERCIO se maneja aunque no sea estrictamente 'required' aquí
-        if 'COMERCIO' not in df_raw.columns:
-             st.warning("Archivo histórico: Columna 'COMERCIO' no encontrada. Se continuará, pero puede afectar la precisión.")
-             df_raw['COMERCIO'] = '' # Añadir columna vacía para evitar errores posteriores
+        # Añadir COMERCIO si no existe para evitar errores posteriores
+        if 'COMERCIO' not in df.columns:
+            st.warning("Archivo histórico: Columna 'COMERCIO' no encontrada. Se creará vacía.")
+            df['COMERCIO'] = ''
 
-        if not all(col in df_raw.columns for col in required):
-            missing = [col for col in required if col not in df_raw.columns]
+        missing = [col for col in required if col not in df.columns]
+        if missing:
             st.error(f"Archivo histórico: Faltan columnas esenciales: {', '.join(missing)}")
             return None
 
-        df_std = pd.DataFrame()
+        # --- Procesamiento de Columnas ---
+        df_std = pd.DataFrame() # DataFrame estandarizado final
 
-        # Procesar columnas de texto una por una con chequeos
+        # ** Texto (CONCEPTO, COMERCIO, CATEGORÍA, SUBCATEGORIA) **
         text_cols_mapping = {
             CONCEPTO_STD: 'CONCEPTO',
-            COMERCIO_STD: 'COMERCIO',
+            COMERCIO_STD: 'COMERCIO', # Ya nos aseguramos que existe
             CATEGORIA_STD: 'CATEGORÍA',
             SUBCATEGORIA_STD: 'SUBCATEGORIA'
         }
-
         for std_col, raw_col in text_cols_mapping.items():
-            st.write(f"Debug: Procesando columna de texto '{raw_col}' -> '{std_col}'")
-            if raw_col in df_raw.columns:
+            st.write(f"Debug (parse_historic): Procesando '{raw_col}' -> '{std_col}'")
+            if raw_col not in df.columns: # Doble chequeo por si acaso
+                 st.error(f"Error Interno: Columna '{raw_col}' desapareció.")
+                 return None
+            try:
+                # 1. Seleccionar Serie y asegurar que es string ANTES de .str
+                series = df[raw_col].fillna('').astype(str)
+                # 2. Aplicar métodos de string usando .str
+                df_std[std_col] = series.str.lower().str.strip()
+                st.write(f"Debug (parse_historic): Columna '{std_col}' procesada OK.")
+            except AttributeError as ae:
+                # Este error es el que reportas. Intentemos dar más info.
+                st.error(f"!!! Error de Atributo procesando '{raw_col}' -> '{std_col}'. Esto usualmente significa que la conversión a string falló o la columna contiene datos inesperados.")
+                # Intentar mostrar tipos de datos problemáticos
                 try:
-                    # Paso 1: Seleccionar Serie y rellenar NaNs
-                    series = df_raw[raw_col].fillna('')
-                    # Paso 2: Convertir a string explícitamente
-                    series_str = series.astype(str)
-                    # Paso 3: Aplicar métodos de string con .str
-                    series_lower = series_str.str.lower()
-                    series_stripped = series_lower.str.strip()
-                    df_std[std_col] = series_stripped
-                    st.write(f"Debug: Columna '{raw_col}' procesada.")
-                except AttributeError as ae:
-                     st.error(f"Error de atributo procesando columna '{raw_col}'. ¿Contiene datos no textuales inesperados? Error: {ae}")
-                     st.error(f"Primeros valores problemáticos:\n{df_raw[raw_col][~df_raw[raw_col].apply(lambda x: isinstance(x, (str, int, float, type(None))))].head()}")
-                     return None
-                except Exception as e:
-                     st.error(f"Error inesperado procesando columna de texto '{raw_col}': {e}")
-                     st.error(traceback.format_exc())
-                     return None
-            elif std_col == COMERCIO_STD: # Si la columna COMERCIO original no existe
-                 df_std[COMERCIO_STD] = '' # Crearla vacía
-                 st.write(f"Debug: Columna '{raw_col}' no encontrada, creada vacía como '{std_col}'.")
-            # Si falta otra columna (Categoría, etc.), ya debería haber fallado en el check 'required'
+                    problematic_types = df[raw_col].apply(type).value_counts()
+                    st.error(f"Tipos de datos encontrados en '{raw_col}':\n{problematic_types}")
+                    # Mostrar algunos valores problemáticos si es posible
+                    non_string_indices = df[raw_col].apply(lambda x: not isinstance(x, (str, type(None), float, int))).index # Buscar no strings/None/numéricos
+                    if not non_string_indices.empty:
+                         st.error(f"Primeros valores no textuales en '{raw_col}':\n{df.loc[non_string_indices, raw_col].head()}")
+                except Exception as e_diag:
+                    st.error(f"No se pudo diagnosticar el error de atributo: {e_diag}")
+                return None # Detener el proceso si hay error aquí
+            except Exception as e:
+                st.error(f"Error inesperado procesando texto en '{raw_col}': {e}")
+                st.error(traceback.format_exc())
+                return None
 
-
-        # Procesar Importe
-        st.write("Debug: Procesando IMPORTE")
+        # ** Importe **
+        st.write("Debug (parse_historic): Procesando IMPORTE")
         try:
-            df_std[IMPORTE_STD] = pd.to_numeric(df_raw['IMPORTE'].astype(str).str.replace(',', '.', regex=False), errors='coerce')
+            importe_str = df['IMPORTE'].astype(str).str.replace(',', '.', regex=False)
+            df_std[IMPORTE_STD] = pd.to_numeric(importe_str, errors='coerce')
             if df_std[IMPORTE_STD].isnull().any():
-                 st.warning("Archivo histórico: Algunos importes no pudieron convertirse a número.")
+                st.warning("Archivo histórico: Algunos importes no pudieron convertirse a número (ahora son NaN).")
         except Exception as e:
             st.error(f"Error procesando IMPORTE en archivo histórico: {e}")
             return None
 
-        # Procesar Fechas
-        st.write("Debug: Procesando Fechas")
+        # ** Fechas **
+        st.write("Debug (parse_historic): Procesando Fechas")
         try:
             for col in ['AÑO', 'MES', 'DIA']:
-                df_std[col] = pd.to_numeric(df_raw[col], errors='coerce').fillna(0).astype(int)
+                # Convertir a numérico, errores a NaN, llenar NaN con 0, luego a int
+                df_std[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+                # Validar rangos básicos (opcional pero útil)
+                if col == 'MES' and not df_std[col].between(1, 12, inclusive='both').all():
+                     st.warning(f"Valores de MES fuera del rango 1-12 detectados en columna '{col}'.")
+                if col == 'DIA' and not df_std[col].between(1, 31, inclusive='both').all():
+                     st.warning(f"Valores de DIA fuera del rango 1-31 detectados en columna '{col}'.")
         except Exception as e:
             st.error(f"Error procesando Fechas en archivo histórico: {e}")
             return None
 
-        # Crear columna de texto para entrenamiento
-        st.write("Debug: Creando TEXTO_MODELO")
-        df_std[TEXTO_MODELO] = df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]
-        df_std[TEXTO_MODELO] = df_std[TEXTO_MODELO].str.strip()
+        # ** Crear Texto para Modelo **
+        st.write("Debug (parse_historic): Creando TEXTO_MODELO")
+        try:
+            # Asegurarse que las columnas existen antes de sumar
+            if CONCEPTO_STD not in df_std: df_std[CONCEPTO_STD] = ''
+            if COMERCIO_STD not in df_std: df_std[COMERCIO_STD] = ''
+            df_std[TEXTO_MODELO] = df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]
+            df_std[TEXTO_MODELO] = df_std[TEXTO_MODELO].str.strip()
+        except Exception as e:
+             st.error(f"Error creando TEXTO_MODELO: {e}")
+             return None
 
-        # Filtrar filas sin categoría o importe válido
-        st.write("Debug: Filtrando filas inválidas")
+        # ** Filtrar Filas Inválidas **
+        st.write("Debug (parse_historic): Filtrando filas finales...")
         initial_rows = len(df_std)
-        df_std = df_std.dropna(subset=[IMPORTE_STD, CATEGORIA_STD]) # Asegurar que categoría no sea NaN
-        df_std = df_std[df_std[CATEGORIA_STD] != ''] # Asegurar que categoría no sea vacía
-        st.write(f"Debug: Filas antes: {initial_rows}, después de filtrar importe/categoría: {len(df_std)}")
+        # Asegurar que CATEGORIA_STD existe antes de filtrar
+        if CATEGORIA_STD not in df_std.columns:
+             st.error("Error Interno: Falta la columna CATEGORIA_STD antes del filtrado final.")
+             return None
+
+        df_std = df_std.dropna(subset=[IMPORTE_STD, CATEGORIA_STD])
+        df_std = df_std[df_std[CATEGORIA_STD] != '']
+        rows_after_filter = len(df_std)
+        st.write(f"Debug (parse_historic): Filas antes: {initial_rows}, después de filtrar NaN importe/categoría y categoría vacía: {rows_after_filter}")
 
         if df_std.empty:
-            st.warning("No se encontraron filas válidas con categorías e importes en el archivo histórico después del filtrado.")
-            # Devolvemos DF vacío para no romper la lógica posterior, pero el entrenamiento fallará
-            return pd.DataFrame(columns=df_std.columns)
+            st.warning("No se encontraron filas válidas con categorías e importes en el archivo histórico después del filtrado final.")
+            return pd.DataFrame() # Devolver vacío para permitir continuar, aunque entrenamiento fallará
 
-        st.write("Debug: parse_historic_categorized finalizado.")
+        st.write("Debug (parse_historic): Finalizado con éxito.")
         return df_std
 
     except Exception as e:
-        st.error(f"Error general parseando archivo histórico: {e}")
+        st.error(f"Error general y crítico parseando archivo histórico: {e}")
         st.error(traceback.format_exc()) # Imprimir traceback completo
         return None
 
+# --- read_sample_csv (sin cambios respecto a la versión anterior) ---
 def read_sample_csv(uploaded_file):
     """Lee un CSV de muestra y devuelve el DataFrame y sus columnas."""
     if uploaded_file is None:
@@ -189,37 +224,34 @@ def read_sample_csv(uploaded_file):
         st.error(f"Error leyendo archivo de muestra: {e}")
         return None, []
 
-# Funciones de ML (adaptadas para usar columnas _STD)
+
+# --- extract_knowledge_std (sin cambios) ---
 @st.cache_data
 def extract_knowledge_std(df_std):
-    # Extrae conocimiento del DataFrame estandarizado
     knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
     if df_std is None or CATEGORIA_STD not in df_std.columns or df_std.empty:
         st.warning("No hay datos estandarizados válidos para extraer conocimiento.")
         return knowledge
     knowledge['categorias'] = sorted([c for c in df_std[CATEGORIA_STD].dropna().unique() if c])
     for cat in knowledge['categorias']:
-        # Subcategorías
         subcat_col = SUBCATEGORIA_STD
         if subcat_col in df_std.columns:
              subcats_series = df_std.loc[df_std[CATEGORIA_STD] == cat, subcat_col].dropna()
              knowledge['subcategorias'][cat] = sorted([s for s in subcats_series.unique() if s])
         else:
              knowledge['subcategorias'][cat] = []
-        # Comercios
         comercio_col = COMERCIO_STD
         if comercio_col in df_std.columns:
              comers_series = df_std.loc[df_std[CATEGORIA_STD] == cat, comercio_col].dropna()
              comers_list = sorted([c for c in comers_series.unique() if c and c != 'n/a'])
              knowledge['comercios'][cat] = comers_list
         else:
-            knowledge['comercios'][cat] = [] # Asegurar que existe la llave
+            knowledge['comercios'][cat] = []
     return knowledge
 
-
+# --- train_classifier_std (sin cambios) ---
 @st.cache_resource # Cachear el modelo y vectorizador
 def train_classifier_std(df_std):
-    # Entrena el clasificador usando datos estandarizados
     report = "Modelo no entrenado."
     model = None; vectorizer = None
     required = [TEXTO_MODELO, CATEGORIA_STD]
@@ -236,41 +268,35 @@ def train_classifier_std(df_std):
     try:
         X = df_train[TEXTO_MODELO]; y = df_train[CATEGORIA_STD]
 
-        # Split (manejar pocos datos)
         test_available = False
-        if len(y.unique()) > 1 and len(y) > 5: # Umbral simple para split
+        if len(y.unique()) > 1 and len(y) > 5:
              try:
-                 # Asegurar que y no contenga NaNs antes de estratificar
                  valid_idx = y.dropna().index
                  X_clean = X[valid_idx]
                  y_clean = y[valid_idx]
-                 if len(y_clean.unique()) > 1 and len(y_clean) > 5 : # Re-chequear después de limpiar y
+                 if len(y_clean.unique()) > 1 and len(y_clean) > 5 :
                     X_train, X_test, y_train, y_test = train_test_split(X_clean, y_clean, test_size=0.2, random_state=42, stratify=y_clean)
                     test_available = True
-                 else: # No estratificar si aún no cumple condiciones
+                 else:
                       X_train, X_test, y_train, y_test = train_test_split(X_clean, y_clean, test_size=0.2, random_state=42)
                       test_available = True
-
-             except ValueError: # Si falla el split por alguna razón
+             except ValueError:
                  st.warning("No se pudo realizar el split estratificado, usando split simple.")
                  X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                 test_available = True # Se intentó split
-        else: # No hacer split
+                 test_available = True
+        else:
              X_train, y_train = X, y
-             X_test, y_test = pd.Series(dtype='str'), pd.Series(dtype='str') # Vacío para evitar error
+             X_test, y_test = pd.Series(dtype='str'), pd.Series(dtype='str')
 
-        # Train
         vectorizer = TfidfVectorizer()
         X_train_vec = vectorizer.fit_transform(X_train)
         model = MultinomialNB()
         model.fit(X_train_vec, y_train)
 
-        # Report (if possible)
         if test_available and not X_test.empty:
             try:
                 X_test_vec = vectorizer.transform(X_test)
                 y_pred = model.predict(X_test_vec)
-                 # Obtener etiquetas presentes en ambos y_test y y_pred para evitar errores
                 present_labels = sorted(list(set(y_test.unique()) | set(y_pred)))
                 report = classification_report(y_test, y_pred, labels=present_labels, zero_division=0)
             except Exception as report_err:
@@ -280,25 +306,22 @@ def train_classifier_std(df_std):
 
     except Exception as e:
          report = f"Error entrenamiento: {e}"
-         model, vectorizer = None, None # Asegurar que no se devuelvan objetos inválidos
+         model, vectorizer = None, None
 
     return model, vectorizer, report
 
+# --- standardize_data_with_mapping (sin cambios) ---
 def standardize_data_with_mapping(df_raw, mapping):
     """Aplica el mapeo guardado para estandarizar un DataFrame nuevo."""
     try:
         df_std = pd.DataFrame()
-        # Asegurar nombres de columna limpios en el DF raw
         df_raw.columns = [str(col).strip() for col in df_raw.columns]
-        original_columns = df_raw.columns.tolist() # Lista de columnas originales limpias
+        original_columns = df_raw.columns.tolist()
 
-
-        # 1. Mapear columnas básicas usando el mapping['columns']
-        # Crear un df temporal solo con las columnas mapeadas
         temp_std_data = {}
-        found_essential = {std_col: False for std_col in MANDATORY_STD_COLS if std_col != FECHA_STD} # Track esenciales (excluye fecha por ahora)
+        found_essential = {std_col: False for std_col in MANDATORY_STD_COLS if std_col != FECHA_STD}
         found_optional = {std_col: False for std_col in OPTIONAL_STD_COLS}
-        source_cols_used = [] # Track columnas fuente usadas en el mapeo
+        source_cols_used = []
 
         for std_col, source_col in mapping['columns'].items():
              if source_col in original_columns:
@@ -306,40 +329,33 @@ def standardize_data_with_mapping(df_raw, mapping):
                   source_cols_used.append(source_col)
                   if std_col in found_essential: found_essential[std_col] = True
                   if std_col in found_optional: found_optional[std_col] = True
-             elif std_col in MANDATORY_STD_COLS and std_col != FECHA_STD: # Esencial (excluye FECHA) no encontrado
+             elif std_col in MANDATORY_STD_COLS and std_col != FECHA_STD:
                   st.error(f"¡Error Crítico! La columna esencial mapeada '{source_col}' para '{std_col}' no existe en este archivo.")
                   return None
-             elif std_col in OPTIONAL_STD_COLS or std_col == FECHA_STD: # Opcional o Fecha no encontrado
-                  st.info(f"Columna opcional/fecha mapeada '{source_col}' para '{std_col}' no encontrada. Se omitirá o creará vacía.")
-                  # No añadirla a temp_std_data si no se encuentra
+             elif std_col in OPTIONAL_STD_COLS or std_col == FECHA_STD:
+                  st.info(f"Columna opcional/fecha mapeada '{source_col}' para '{std_col}' no encontrada. Se omitirá.")
 
-        # Crear DataFrame estandarizado desde el diccionario temporal
         df_std = pd.DataFrame(temp_std_data)
-
-        # Verificar si faltan esenciales después del mapeo inicial
         missing_essential_mapped = [k for k, v in found_essential.items() if not v]
         if missing_essential_mapped:
              st.error(f"Faltan columnas esenciales en el archivo que estaban mapeadas: {missing_essential_mapped}")
              return None
 
-
-        # 2. Manejar Fecha
         fecha_col_source = mapping['columns'].get(FECHA_STD)
         año_col_source = mapping['columns'].get(AÑO_STD)
         mes_col_source = mapping['columns'].get(MES_STD)
         dia_col_source = mapping['columns'].get(DIA_STD)
         date_processed_ok = False
 
-        if fecha_col_source and fecha_col_source in source_cols_used: # Opción 1: Columna única de fecha (ya está en df_std)
+        if fecha_col_source and fecha_col_source in source_cols_used:
              date_format = mapping.get('date_format')
              if not date_format:
-                  st.error(f"Error: Mapeo para '{FECHA_STD}' existe pero falta el formato de fecha.")
+                  st.error(f"Error: Se mapeó la columna de fecha '{fecha_col_source}' pero falta el formato de fecha en el mapeo.")
                   return None
              try:
-                # Limpiar antes de convertir
                 date_series = df_std[FECHA_STD].astype(str).str.strip()
                 valid_dates = pd.to_datetime(date_series, format=date_format, errors='coerce')
-                if valid_dates.isnull().all(): # Si *todas* las fechas fallan
+                if valid_dates.isnull().all():
                       st.error(f"Ninguna fecha en '{fecha_col_source}' coincide con el formato '{date_format}'. Verifique el formato y los datos.")
                       return None
                 elif valid_dates.isnull().any():
@@ -348,7 +364,7 @@ def standardize_data_with_mapping(df_raw, mapping):
                 df_std[AÑO_STD] = valid_dates.dt.year.fillna(0).astype(int)
                 df_std[MES_STD] = valid_dates.dt.month.fillna(0).astype(int)
                 df_std[DIA_STD] = valid_dates.dt.day.fillna(0).astype(int)
-                df_std = df_std.drop(columns=[FECHA_STD]) # Eliminar la columna estándar original
+                df_std = df_std.drop(columns=[FECHA_STD])
                 date_processed_ok = True
              except ValueError as ve:
                  st.error(f"Error de formato de fecha para '{fecha_col_source}' con formato '{date_format}'. ¿Es correcto el formato? Error: {ve}")
@@ -357,17 +373,16 @@ def standardize_data_with_mapping(df_raw, mapping):
                  st.error(f"Error inesperado procesando fecha única '{fecha_col_source}': {e_date}")
                  return None
 
-        elif año_col_source and mes_col_source and dia_col_source: # Opción 2: Columnas separadas
+        elif año_col_source and mes_col_source and dia_col_source:
             all_date_cols_found = True
             for col_std, col_source in zip([AÑO_STD, MES_STD, DIA_STD], [año_col_source, mes_col_source, dia_col_source]):
-                 if col_source in source_cols_used: # Ya debería estar en df_std
+                 if col_source in source_cols_used:
                      try:
-                         # Forzar a numérico, errores a NaN, llenar NaN con 0, luego a int
                          df_std[col_std] = pd.to_numeric(df_std[col_std], errors='coerce').fillna(0).astype(int)
                      except Exception as e_num:
                           st.error(f"Error convirtiendo columna de fecha '{col_source}' a número: {e_num}")
-                          all_date_cols_found = False; break # Salir del bucle si una falla
-                 else: # Mapeada pero no encontrada (error raro, pero chequear)
+                          all_date_cols_found = False; break
+                 else:
                       st.error(f"Error: La columna de fecha mapeada '{col_source}' para '{col_std}' no se encontró en los datos procesados.")
                       all_date_cols_found = False; break
             if all_date_cols_found: date_processed_ok = True
@@ -376,9 +391,8 @@ def standardize_data_with_mapping(df_raw, mapping):
              st.error("Error crítico: No se pudo procesar la información de fecha según el mapeo.")
              return None
 
-        # 3. Limpiar Importe
-        importe_col_source = mapping['columns'].get(IMPORTE_STD) # El nombre original
-        if IMPORTE_STD in df_std.columns: # Usar la columna estándar que ya existe en df_std
+        importe_col_source = mapping['columns'].get(IMPORTE_STD)
+        if IMPORTE_STD in df_std.columns:
             try:
                 importe_str = df_std[IMPORTE_STD].fillna('0').astype(str)
                 thousands_sep = mapping.get('thousands_sep')
@@ -391,43 +405,35 @@ def standardize_data_with_mapping(df_raw, mapping):
             except Exception as e_imp:
                  st.error(f"Error procesando importe desde columna '{importe_col_source}': {e_imp}")
                  return None
-        else: # No debería pasar si la validación inicial funcionó
-             st.error("Error interno: Falta la columna IMPORTE_STD mapeada.")
+        elif importe_col_source:
+            st.error(f"Error interno: Columna de importe '{importe_col_source}' mapeada pero no encontrada.")
+            return None
+        else:
+             st.error("Error: La columna IMPORTE_STD no fue mapeada.")
              return None
 
-
-        # 4. Limpiar Concepto y Comercio (columnas estándar ya presentes en df_std)
         for col_std in [CONCEPTO_STD, COMERCIO_STD]:
             if col_std in df_std.columns:
                 df_std[col_std] = df_std[col_std].fillna('').astype(str).str.lower().str.strip()
-            elif col_std == COMERCIO_STD: # Si COMERCIO_STD no se mapeó/encontró
+            elif col_std == COMERCIO_STD:
                  df_std[COMERCIO_STD] = ''
 
-
-        # 5. Crear Texto para Modelo
-        # Asegurar que ambas columnas existen antes de concatenar
         if CONCEPTO_STD not in df_std.columns: df_std[CONCEPTO_STD] = ''
         if COMERCIO_STD not in df_std.columns: df_std[COMERCIO_STD] = ''
         df_std[TEXTO_MODELO] = df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]
         df_std[TEXTO_MODELO] = df_std[TEXTO_MODELO].str.strip()
 
-        # 6. Mantener columnas originales no usadas en el mapeo estándar
-        # Comparar original_columns con source_cols_used
-        original_cols_to_keep = [c for c in original_columns if c not in source_cols_used]
+        mapped_source_cols = list(mapping['columns'].values())
+        original_cols_to_keep = [c for c in original_columns if c not in mapped_source_cols]
         for col in original_cols_to_keep:
-              # Evitar sobrescribir si por casualidad una columna original
-              # tiene el mismo nombre que una estándar ya creada (ej. AÑO)
               target_col_name = f"ORIG_{col}"
               if target_col_name not in df_std.columns:
                    df_std[target_col_name] = df_raw[col]
-              else: # Añadir sufijo si ya existe
+              else:
                    suffix = 1
-                   while f"ORIG_{col}_{suffix}" in df_std.columns:
-                       suffix += 1
+                   while f"ORIG_{col}_{suffix}" in df_std.columns: suffix += 1
                    df_std[f"ORIG_{col}_{suffix}"] = df_raw[col]
 
-
-        # Devolver solo filas con importe válido y texto de modelo no vacío/NaN
         df_std = df_std.dropna(subset=[IMPORTE_STD, TEXTO_MODELO])
         df_std = df_std[df_std[TEXTO_MODELO]!='']
 
@@ -435,9 +441,8 @@ def standardize_data_with_mapping(df_raw, mapping):
 
     except Exception as e:
         st.error(f"Error inesperado aplicando mapeo '{mapping.get('bank_name', 'Desconocido')}': {e}")
-        st.error(traceback.format_exc()) # Imprimir traceback completo para depuración
+        st.error(traceback.format_exc())
         return None
-
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
@@ -450,12 +455,14 @@ with st.expander("Fase 1: Entrenar Modelo con Datos Históricos Categorizados", 
     uploaded_historic_file = st.file_uploader("Cargar Archivo Histórico Categorizado (.csv)", type="csv", key="historic_uploader_f1")
 
     if uploaded_historic_file:
+        # Mostrar botón solo si hay archivo
         if st.button("🧠 Entrenar Modelo y Aprender Conocimiento Inicial", key="train_historic_f1"):
             with st.spinner("Procesando archivo histórico y entrenando..."):
                 # Leer el archivo raw ANTES de pasarlo a la función de parseo
                 df_raw_hist, _ = read_sample_csv(uploaded_historic_file)
                 if df_raw_hist is not None:
                     df_std_hist = parse_historic_categorized(df_raw_hist.copy()) # Pasar copia
+                    # Continuar solo si el parseo fue exitoso y devolvió datos
                     if df_std_hist is not None and not df_std_hist.empty:
                         st.success("Archivo histórico parseado.")
                         # Extraer conocimiento
@@ -473,16 +480,20 @@ with st.expander("Fase 1: Entrenar Modelo con Datos Históricos Categorizados", 
                             st.success("¡Modelo entrenado exitosamente!")
                             st.sidebar.subheader("Evaluación Modelo Base")
                             with st.sidebar.expander("Ver Informe"): st.text(st.session_state.training_report)
-                        else:
+                        else: # Fallo el entrenamiento
                             st.error("Fallo en el entrenamiento del modelo base.")
                             st.session_state.model_trained = False
                             st.session_state.training_report = report # Guardar mensaje de error
                             st.sidebar.error("Entrenamiento Fallido")
                             st.sidebar.text(st.session_state.training_report)
+                    # El else aquí significa que parse_historic falló o devolvió vacío
                     else:
-                        st.error("No se pudo parsear el archivo histórico o no contenía datos válidos.")
+                        st.error("No se pudo parsear el archivo histórico o no contenía datos válidos para entrenar.")
+                        st.session_state.model_trained = False # Asegurar que el estado es correcto
+                # El else aquí significa que read_sample_csv falló
                 else:
                      st.error("No se pudo leer el archivo histórico.")
+                     st.session_state.model_trained = False
 
 # --- Fase 2: Aprendizaje de Formatos Bancarios ---
 with st.expander("Fase 2: Aprender Formatos de Archivos Bancarios"):
@@ -626,11 +637,12 @@ with st.expander("Fase 2: Aprender Formatos de Archivos Bancarios"):
 st.sidebar.divider()
 st.sidebar.subheader("Mapeos Bancarios Guardados")
 if st.session_state.bank_mappings:
-    # Convertir a JSON para mostrar (evita problemas con objetos no serializables si los hubiera)
     try:
-        st.sidebar.json(json.dumps(st.session_state.bank_mappings, indent=2), expanded=False) # Indentado para legibilidad
-    except TypeError:
-         st.sidebar.write("No se pueden mostrar los mapeos (posible objeto no serializable).") # Fallback
+        # Usar json.dumps para asegurar serialización correcta antes de st.json
+        st.sidebar.json(json.dumps(st.session_state.bank_mappings, indent=2), expanded=False)
+    except Exception as e_json:
+         st.sidebar.error(f"No se pueden mostrar los mapeos: {e_json}")
+         st.sidebar.write(st.session_state.bank_mappings) # Fallback a escritura simple
 else:
     st.sidebar.info("Aún no se han guardado mapeos.")
 
@@ -682,7 +694,9 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
                                              st.subheader("📊 Resultados de la Categorización")
                                              # Seleccionar y reordenar columnas para mostrar
                                              display_cols = [CATEGORIA_PREDICHA, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
-                                             if COMERCIO_STD in df_pred.columns: display_cols.insert(2, COMERCIO_STD)
+                                             # Insertar COMERCIO si existe después de estandarizar
+                                             if COMERCIO_STD in df_pred.columns:
+                                                  display_cols.insert(2, COMERCIO_STD)
                                              # Añadir columnas originales relevantes
                                              orig_cols = [c for c in df_pred.columns if c.startswith('ORIG_')]
                                              display_cols.extend(orig_cols)
