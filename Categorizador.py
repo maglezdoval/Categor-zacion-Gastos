@@ -4,52 +4,87 @@ from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import classification_report
-import io # Necesario para leer el archivo subido
+import io
 
-# --- Funciones Auxiliares (con caché para rendimiento) ---
+# --- Session State Initialization ---
+# To store the trained model and related objects between runs
+if 'model_trained' not in st.session_state:
+    st.session_state.model_trained = False
+if 'model' not in st.session_state:
+    st.session_state.model = None
+if 'vectorizer' not in st.session_state:
+    st.session_state.vectorizer = None
+if 'knowledge' not in st.session_state:
+    st.session_state.knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
+if 'report_string' not in st.session_state:
+    st.session_state.report_string = ""
 
-# Cache para la carga y procesamiento de datos
-@st.cache_data
-def load_and_process_data(uploaded_file):
+# --- Functions (Cached) ---
+
+@st.cache_data # Cache the result of loading and processing
+def load_and_process_data(uploaded_file, is_training_data=True):
     """Carga y preprocesa los datos desde un archivo subido."""
+    if uploaded_file is None:
+        return None
     try:
-        # Leer el archivo subido directamente
         bytes_data = uploaded_file.getvalue()
-        # Intentar leer con utf-8, si falla, probar con latin1
         try:
             df = pd.read_csv(io.BytesIO(bytes_data), encoding='utf-8', sep=';')
         except UnicodeDecodeError:
             df = pd.read_csv(io.BytesIO(bytes_data), encoding='latin1', sep=';')
 
-        # Filtrar filas donde la categoría o subcategoría no esté presente (importante para el aprendizaje)
-        df = df.dropna(subset=['CATEGORÍA', 'SUBCATEGORIA'])
-        df = df[df['CATEGORÍA'].str.strip() != ''] # Asegurar que no haya categorías vacías
+        # --- Basic Cleaning ---
+        # Convert column names to uppercase for consistency
+        df.columns = [col.upper().strip() for col in df.columns]
 
-        # Limpieza y normalización
-        # Manejar posibles errores si 'IMPORTE' no es convertible directamente
-        try:
-            df['IMPORTE'] = df['IMPORTE'].str.replace(',', '.', regex=False).astype(float)
-        except AttributeError:
-            st.warning("La columna 'IMPORTE' no parece ser de tipo texto. Intentando conversión directa.")
+        # Check for essential columns
+        required_cols = ['CONCEPTO']
+        if is_training_data:
+            required_cols.extend(['CATEGORÍA', 'SUBCATEGORIA', 'IMPORTE'])
+        else: # For new data, 'COMERCIO' is needed if model used it
+             if 'COMERCIO' in st.session_state.get('required_features',[]): # Check if COMERCIO was used
+                  required_cols.append('COMERCIO')
+
+
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            st.error(f"Faltan columnas esenciales en el archivo {'de entrenamiento' if is_training_data else 'nuevo'}: {', '.join(missing_cols)}")
+            return None
+
+        # Handle 'IMPORTE' only if it's training data (or present in new)
+        if 'IMPORTE' in df.columns:
             try:
-                df['IMPORTE'] = df['IMPORTE'].astype(float)
-            except ValueError:
-                st.error("No se pudo convertir la columna 'IMPORTE' a número. Revise el formato.")
-                return None
-        except ValueError:
-             st.error("Error al convertir 'IMPORTE' a número. Verifique que no haya valores no numéricos (después de reemplazar ',').")
-             return None
+                df['IMPORTE'] = df['IMPORTE'].astype(str).str.replace(',', '.', regex=False).astype(float)
+            except Exception as e:
+                st.warning(f"No se pudo convertir 'IMPORTE': {e}. Se continuará sin ella si no es necesaria.")
+                # Decide si eliminarla o dejarla tal cual si no es crucial
+                # df = df.drop(columns=['IMPORTE']) # Opcional: eliminarla si causa problemas
 
+        # Handle Text Columns (including optional 'COMERCIO')
+        text_cols_base = ['CONCEPTO']
+        if 'COMERCIO' in df.columns:
+            text_cols_base.append('COMERCIO')
+        if is_training_data:
+            text_cols_base.extend(['CATEGORÍA', 'SUBCATEGORIA'])
 
-        text_cols = ['CONCEPTO', 'COMERCIO', 'CATEGORÍA', 'SUBCATEGORIA']
-        for col in text_cols:
-             if col in df.columns:
-                # Rellenar NaNs con string vacío antes de aplicar métodos de string
+        for col in text_cols_base:
+            if col in df.columns:
                 df[col] = df[col].fillna('').astype(str).str.lower().str.strip()
 
+        # --- Processing Specific to Data Type ---
+        if is_training_data:
+            df = df.dropna(subset=['CATEGORÍA']) # Crucial for training
+            df = df[df['CATEGORÍA'] != '']
+            if df.empty:
+                st.error("El archivo de entrenamiento no contiene filas válidas con categorías después de la limpieza.")
+                return None
+            # Combine features for training text
+            df['TEXTO_ENTRENAMIENTO'] = df['CONCEPTO'] + ' ' + df.get('COMERCIO', '') # Use .get for optional COMERCIO
 
-        # Combinar CONCEPTO y COMERCIO para el aprendizaje
-        df['TEXTO'] = df['CONCEPTO'] + ' ' + df['COMERCIO']
+
+        else: # Processing for new data
+            # Combine features for prediction using the same logic as training
+            df['TEXTO_A_CATEGORIZAR'] = df['CONCEPTO'] + ' ' + df.get('COMERCIO', '') # Use .get
 
         return df
 
@@ -57,214 +92,198 @@ def load_and_process_data(uploaded_file):
         st.error(f"Error al cargar o procesar el archivo CSV: {e}")
         return None
 
-# Cache para la extracción de la base de conocimiento
 @st.cache_data
 def extract_knowledge(df):
-    """Extrae categorías, subcategorías y comercios del DataFrame."""
+    """Extrae categorías, subcategorías y comercios del DataFrame de entrenamiento."""
+    knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
     if df is None or 'CATEGORÍA' not in df.columns:
-        return [], {}, {}
+        return knowledge
 
-    categorias = df['CATEGORÍA'].unique().tolist()
-    # Asegurarse de que '' no esté en categorías si surge de alguna fila
-    categorias = [cat for cat in categorias if cat]
+    # Use .dropna() before unique() on the relevant columns
+    knowledge['categorias'] = sorted([cat for cat in df['CATEGORÍA'].dropna().unique() if cat])
+
+    for cat in knowledge['categorias']:
+        # Subcategorías
+        subcat_col = 'SUBCATEGORIA'
+        if subcat_col in df.columns:
+             subcats_series = df.loc[df['CATEGORÍA'] == cat, subcat_col].dropna()
+             subcats_series = subcats_series[subcats_series != '']
+             knowledge['subcategorias'][cat] = sorted(subcats_series.unique().tolist())
+        else:
+             knowledge['subcategorias'][cat] = []
 
 
-    subcategorias_por_categoria = {}
-    comercios_por_categoria = {}
+        # Comercios
+        comercio_col = 'COMERCIO'
+        if comercio_col in df.columns:
+             comers_series = df.loc[df['CATEGORÍA'] == cat, comercio_col].dropna()
+             comers_series = comers_series[comers_series.str.strip() != '']
+             comers_list = sorted([com for com in comers_series.unique() if com != 'n/a'])
+             knowledge['comercios'][cat] = comers_list
+        else:
+            knowledge['comercios'][cat] = []
 
-    if 'SUBCATEGORIA' in df.columns:
-        for categoria in categorias:
-             # Filtrar NaNs o vacíos en subcategoría y comercio antes de unique()
-             subcats_series = df.loc[df['CATEGORÍA'] == categoria, 'SUBCATEGORIA'].dropna()
-             subcats_series = subcats_series[subcats_series.str.strip() != '']
-             subcategorias = subcats_series.unique().tolist()
-             subcategorias_por_categoria[categoria] = subcategorias
 
-    if 'COMERCIO' in df.columns:
-         for categoria in categorias:
-            comers_series = df.loc[df['CATEGORÍA'] == categoria, 'COMERCIO'].dropna()
-            comers_series = comers_series[comers_series.str.strip() != '']
-            comercios = comers_series.unique().tolist()
-            # Quitar 'n/a' si existe como comercio aprendido
-            comercios = [com for com in comercios if com != 'n/a']
-            comercios_por_categoria[categoria] = comercios
+    return knowledge
 
-    return categorias, subcategorias_por_categoria, comercios_por_categoria
+@st.cache_resource # Cache model and vectorizer objects
+def train_classifier(df):
+    """Entrena el modelo de clasificación."""
+    report = "Modelo no entrenado."
+    model = None
+    vectorizer = None
 
-# Cache para el entrenamiento del modelo (más pesado)
-@st.cache_resource # Usar cache_resource para objetos complejos como modelos y vectorizadores
-def train_model(df):
-    """Entrena un modelo de clasificación."""
-    if df is None or df.empty or 'TEXTO' not in df.columns or 'CATEGORÍA' not in df.columns:
-        st.warning("No hay suficientes datos válidos para entrenar el modelo.")
-        return None, None, "No se pudo entrenar el modelo."
+    if df is None or df.empty or 'TEXTO_ENTRENAMIENTO' not in df.columns or 'CATEGORÍA' not in df.columns:
+        st.warning("No hay datos válidos para entrenar.")
+        return model, vectorizer, report
 
-    # Asegurarse de que no haya NaNs en las columnas clave para el modelo
-    df_train = df.dropna(subset=['TEXTO', 'CATEGORÍA'])
-    df_train = df_train[df_train['CATEGORÍA'].str.strip() != '']
+    df_train = df.dropna(subset=['TEXTO_ENTRENAMIENTO', 'CATEGORÍA'])
+    df_train = df_train[df_train['CATEGORÍA'] != ''] # Asegurar categorías no vacías
 
-    if df_train.empty:
-         st.warning("No hay datos válidos para entrenar después de filtrar.")
-         return None, None, "No se pudo entrenar el modelo."
-
-    if len(df_train['CATEGORÍA'].unique()) < 2:
-        st.warning("Se necesita al menos 2 categorías diferentes para entrenar el modelo de clasificación.")
-        return None, None, "Datos insuficientes (menos de 2 categorías)."
-
+    if df_train.empty or len(df_train['CATEGORÍA'].unique()) < 2:
+        st.warning("Datos insuficientes o pocas categorías (<2) para entrenar.")
+        return model, vectorizer, report
 
     try:
-        vectorizer = TfidfVectorizer()
-        X = vectorizer.fit_transform(df_train['TEXTO'])
+        X = df_train['TEXTO_ENTRENAMIENTO']
         y = df_train['CATEGORÍA']
 
-        # Manejar el caso de pocas muestras para el split
-        test_size = 0.2
-        if X.shape[0] * test_size < 1:
-            test_size = 0 # No hacer split si no hay suficientes datos para el test set
-            st.warning("Pocos datos, usando todo para entrenamiento.")
-            X_train, X_test, y_train, y_test = X, X, y, y # Simplificación para evitar error
-        elif len(y.unique()) == 1:
-             st.warning("Solo se detectó una categoría. El modelo predecirá siempre esa categoría.")
-             X_train, X_test, y_train, y_test = X, X, y, y # No se puede estratificar
+        # Split data if enough samples and classes exist
+        unique_classes = y.unique()
+        if len(unique_classes) > 1 and len(y) > 5: # Heurística simple para split
+            try:
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+            except ValueError: # Si no se puede estratificar
+                X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+            test_available = True
         else:
-             # Intentar estratificar si hay más de una clase y suficientes muestras
-             try:
-                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
-             except ValueError:
-                 st.warning("No se pudo estratificar el split. Usando split normal.")
-                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42)
+            X_train, y_train = X, y # Usar todo para entrenar
+            X_test, y_test = pd.Series(dtype='str'), pd.Series(dtype='str') # Vacío para evitar error en reporte
+            test_available = False
+            st.info("Pocos datos o categorías, usando todo para entrenar (sin evaluación detallada).")
 
+        vectorizer = TfidfVectorizer()
+        X_train_vec = vectorizer.fit_transform(X_train)
 
         model = MultinomialNB()
-        model.fit(X_train, y_train)
+        model.fit(X_train_vec, y_train)
 
-        # Generar reporte solo si hay datos de test
-        report_string = "Entrenamiento completado."
-        if test_size > 0 and X_test.shape[0] > 0:
-            try:
-                y_pred = model.predict(X_test)
-                # Obtener las etiquetas presentes en y_test y y_pred para el reporte
-                labels = sorted(list(set(y_test) | set(y_pred)))
-                report_string = classification_report(y_test, y_pred, labels=labels, zero_division=0)
-            except Exception as report_error:
-                report_string = f"Modelo entrenado, pero error al generar reporte: {report_error}"
+        if test_available and not X_test.empty:
+            X_test_vec = vectorizer.transform(X_test)
+            y_pred = model.predict(X_test_vec)
+            labels = sorted(list(set(y_test) | set(y_pred)))
+            report = classification_report(y_test, y_pred, labels=labels, zero_division=0)
+        elif test_available and X_test.empty:
+             report = "Modelo entrenado, pero no hay datos suficientes para un conjunto de prueba."
+        else:
+            report = "Modelo entrenado con todos los datos disponibles."
 
+        st.success("¡Modelo entrenado exitosamente!")
+        # Guardar qué columnas se usaron implícitamente para el texto
+        st.session_state.required_features = ['CONCEPTO']
+        if 'COMERCIO' in df.columns:
+            st.session_state.required_features.append('COMERCIO')
 
-        return model, vectorizer, report_string
 
     except Exception as e:
-        st.error(f"Error durante el entrenamiento del modelo: {e}")
-        return None, None, f"Error en entrenamiento: {e}"
+        st.error(f"Error durante el entrenamiento: {e}")
+        report = f"Error en entrenamiento: {e}"
+
+    return model, vectorizer, report
 
 # --- Interfaz de Streamlit ---
-st.set_page_config(layout="wide") # Aprovechar mejor el espacio
-st.title("📊 Categorizador de Transacciones Bancarias")
+st.set_page_config(layout="wide")
+st.title("📊 Categorizador de Transacciones Bancarias v2")
+
 st.write("""
-Sube tu archivo CSV de gastos (con columnas como CONCEPTO, COMERCIO, CATEGORÍA, SUBCATEGORIA)
-para extraer información y entrenar un modelo básico de categorización.
+**Paso 1:** Sube tu archivo CSV **categorizado** (`Gastos.csv`) para aprender las categorías y entrenar el modelo.
 """)
 
-uploaded_file = st.file_uploader("Carga tu archivo Gastos.csv", type="csv")
+uploaded_training_file = st.file_uploader("Carga tu archivo CSV de ENTRENAMIENTO", type="csv", key="trainer")
 
-if uploaded_file is not None:
-    df = load_and_process_data(uploaded_file)
+if uploaded_training_file:
+    df_train = load_and_process_data(uploaded_training_file, is_training_data=True)
 
-    if df is not None:
-        st.success("Archivo cargado y procesado correctamente!")
-        st.dataframe(df.head()) # Mostrar una vista previa
+    if df_train is not None:
+        st.sidebar.success("Archivo de entrenamiento cargado.")
+        st.session_state.knowledge = extract_knowledge(df_train)
 
-        # Extraer y mostrar base de conocimiento
-        categorias, subcategorias_por_categoria, comercios_por_categoria = extract_knowledge(df)
+        st.sidebar.subheader("Conocimiento Aprendido")
+        with st.sidebar.expander("Ver Categorías"):
+            st.write(st.session_state.knowledge['categorias'])
+        with st.sidebar.expander("Ver Comercios"):
+             st.json(st.session_state.knowledge['comercios'], expanded=False)
+        # No mostrar subcategorías aquí para no saturar
 
-        col1, col2 = st.columns(2) # Crear columnas para mejor distribución
+        # Entrenar el modelo y guardar en session_state
+        st.session_state.model, st.session_state.vectorizer, st.session_state.report_string = train_classifier(df_train.copy())
 
-        with col1:
-            st.header("📚 Base de Conocimiento Extraída")
-            st.subheader("Categorías Detectadas:")
-            if categorias:
-                st.write(categorias)
-            else:
-                st.warning("No se encontraron categorías válidas.")
-
-            st.subheader("Comercios por Categoría:")
-            with st.expander("Ver Comercios Aprendidos"):
-                if comercios_por_categoria:
-                    st.json(comercios_por_categoria, expanded=False)
-                else:
-                     st.warning("No se encontraron comercios válidos asociados a categorías.")
-
-
-        with col2:
-            st.subheader("Subcategorías por Categoría:")
-            if subcategorias_por_categoria:
-                # Usar expanders para que no ocupe tanto espacio si hay muchas categorías
-                for cat, subcats in subcategorias_por_categoria.items():
-                    with st.expander(f"{cat.capitalize()}"):
-                        if subcats:
-                           st.write(subcats)
-                        else:
-                           st.write("_Sin subcategorías específicas encontradas_")
-            else:
-                st.warning("No se encontraron subcategorías válidas.")
-
-
-        st.divider() # Separador visual
-
-        # Entrenar y mostrar resultados del modelo
-        st.header("🤖 Aprendizaje Automático")
-        st.write("Entrenando un modelo simple (Naive Bayes) para predecir 'CATEGORÍA' basado en 'CONCEPTO' y 'COMERCIO'.")
-
-        model, vectorizer, report_string = train_model(df.copy()) # Pasar copia por si acaso
-
-        if model and vectorizer:
-            st.subheader("Informe de Clasificación (Evaluación del Modelo)")
-            st.text(report_string)
-            st.info("Este informe muestra qué tan bien el modelo predice las categorías en una porción de los datos que no usó para aprender (conjunto de prueba).")
-
-            st.divider()
-
-            # Sección para probar la categorización
-            st.header("🧪 Probar Categorización")
-            st.write("Introduce los detalles de una nueva transacción para obtener una predicción de categoría.")
-
-            new_concepto = st.text_input("Nuevo Concepto:")
-            new_comercio = st.text_input("Nuevo Comercio (opcional):")
-
-            if st.button("Categorizar Nueva Transacción"):
-                if not new_concepto:
-                    st.warning("Por favor, introduce al menos el concepto.")
-                else:
-                    texto_nuevo = new_concepto.lower().strip() + ' ' + new_comercio.lower().strip()
-                    try:
-                        vector_nuevo = vectorizer.transform([texto_nuevo])
-                        prediccion = model.predict(vector_nuevo)
-                        probabilidades = model.predict_proba(vector_nuevo)
-                        clases_ordenadas = model.classes_
-
-                        st.subheader("Predicción:")
-                        st.success(f"**Categoría Predicha:** {prediccion[0].capitalize()}")
-
-                        # Mostrar probabilidades (opcional, pero útil)
-                        st.subheader("Probabilidades por Categoría:")
-                        probs_df = pd.DataFrame(probabilidades, columns=clases_ordenadas).T
-                        probs_df.columns = ['Probabilidad']
-                        probs_df = probs_df.sort_values(by='Probabilidad', ascending=False)
-                        st.dataframe(probs_df.style.format("{:.2%}"))
-
-                    except Exception as e:
-                        st.error(f"Error durante la predicción: {e}")
+        if st.session_state.model and st.session_state.vectorizer:
+            st.session_state.model_trained = True
+            st.sidebar.subheader("Resultado Entrenamiento")
+            st.sidebar.text(st.session_state.report_string)
         else:
-            st.error("No se pudo entrenar el modelo. Revisa los datos o los mensajes de advertencia anteriores.")
+            st.session_state.model_trained = False
+            st.sidebar.error("Fallo en el entrenamiento del modelo.")
 
-    else:
-        st.warning("Esperando la carga del archivo CSV...")
+st.divider()
+
+st.write("""
+**Paso 2:** Una vez entrenado el modelo (ver barra lateral), sube tu **nuevo** archivo CSV (sin categorizar) para aplicar la categorización.
+""")
+
+# Solo mostrar el segundo uploader si el modelo está listo
+if st.session_state.model_trained:
+    uploaded_new_file = st.file_uploader("Carga tu archivo CSV NUEVO a categorizar", type="csv", key="categorizer")
+
+    if uploaded_new_file:
+        df_new = load_and_process_data(uploaded_new_file, is_training_data=False)
+
+        if df_new is not None and 'TEXTO_A_CATEGORIZAR' in df_new.columns:
+            st.success("Archivo nuevo cargado.")
+            st.subheader("Vista Previa del Archivo Nuevo (Antes)")
+            st.dataframe(df_new.head())
+
+            try:
+                # Aplicar el vectorizador y el modelo entrenados
+                X_new_vec = st.session_state.vectorizer.transform(df_new['TEXTO_A_CATEGORIZAR'])
+                predictions = st.session_state.model.predict(X_new_vec)
+
+                # Añadir la columna de predicciones
+                df_new['CATEGORIA_PREDICHA'] = predictions
+                 # Opcional: Capitalizar para mejor visualización
+                df_new['CATEGORIA_PREDICHA'] = df_new['CATEGORIA_PREDICHA'].str.capitalize()
+
+
+                # --- (Opcional/Simple) Lógica básica para Subcategoría ---
+                # Aquí podrías añadir una lógica más simple si quieres un placeholder
+                # Por ejemplo, buscar la primera subcategoría conocida para la categoría predicha
+                def get_first_subcategory(predicted_cat):
+                    known_subcats = st.session_state.knowledge['subcategorias'].get(predicted_cat.lower(), [])
+                    return known_subcats[0].capitalize() if known_subcats else "Desconocida"
+
+                # Aplicar la función (esto es muy básico, ¡cuidado con la precisión!)
+                # df_new['SUBCATEGORIA_PREDICHA'] = df_new['CATEGORIA_PREDICHA'].apply(get_first_subcategory)
+                # Por ahora, nos centramos en la categoría principal
+
+                st.subheader("Resultado de la Categorización")
+                st.dataframe(df_new)
+
+                # Botón de descarga
+                st.download_button(
+                    label="📥 Descargar CSV Categorizado",
+                    data=df_new.to_csv(index=False, sep=';').encode('utf-8'), # UTF-8 es más estándar
+                    file_name='gastos_categorizados.csv',
+                    mime='text/csv',
+                )
+
+            except Exception as e:
+                st.error(f"Error al aplicar la categorización: {e}")
+                st.error("Asegúrate de que el archivo nuevo tenga las columnas 'CONCEPTO' y 'COMERCIO' (si se usó en el entrenamiento) con un formato similar al de entrenamiento.")
+
+        elif df_new is not None:
+             st.error("No se encontró la columna combinada 'TEXTO_A_CATEGORIZAR' en el archivo nuevo después del procesamiento.")
+
 
 else:
-     st.info("Por favor, carga un archivo CSV para comenzar.")
-
-st.sidebar.header("Acerca de")
-st.sidebar.info(
-    "Esta aplicación analiza un archivo CSV de gastos, extrae categorías, "
-    "subcategorías y comercios, y entrena un modelo básico para "
-    "predecir categorías de nuevas transacciones."
-)
+    st.warning("Primero carga y procesa el archivo CSV de entrenamiento en el Paso 1.")
