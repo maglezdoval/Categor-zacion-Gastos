@@ -5,7 +5,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.naive_bayes import MultinomialNB
 from sklearn.metrics import classification_report
 import io
-import numpy as np # Import numpy for handling potential NaN issues after conversion
+import numpy as np
+from datetime import datetime # Para manejo de fechas más complejo si fuera necesario
 
 # --- Session State Initialization ---
 if 'model_trained' not in st.session_state:
@@ -18,185 +19,211 @@ if 'knowledge' not in st.session_state:
     st.session_state.knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
 if 'report_string' not in st.session_state:
     st.session_state.report_string = ""
-if 'training_features' not in st.session_state:
-     st.session_state.training_features = [] # Track features used in training text
+if 'processed_training_data' not in st.session_state:
+     st.session_state.processed_training_data = pd.DataFrame() # Para acumular datos estandarizados
+if 'categorized_data_list' not in st.session_state:
+     st.session_state.categorized_data_list = [] # Para guardar resultados de categorización
 
-# --- Functions (Cached) ---
 
-@st.cache_data
-def load_and_process_data(uploaded_file, is_training_data=True):
-    """Carga y preprocesa los datos desde un archivo subido."""
-    if uploaded_file is None:
-        return None
+# --- CONSTANTES ---
+# Nombres estándar de columnas internas
+CONCEPTO_STD = 'CONCEPTO_STD'
+COMERCIO_STD = 'COMERCIO_STD'
+IMPORTE_STD = 'IMPORTE_STD'
+AÑO_STD = 'AÑO'
+MES_STD = 'MES'
+DIA_STD = 'DIA'
+CATEGORIA_STD = 'CATEGORIA_STD'
+SUBCATEGORIA_STD = 'SUBCATEGORIA_STD'
+TEXTO_MODELO = 'TEXTO_MODELO' # Columna combinada para el modelo
+CATEGORIA_PREDICHA = 'CATEGORIA_PREDICHA'
+
+# --- Funciones de Parseo Específicas por Banco ---
+
+def parse_standard_format(df, is_training_data=True):
+    """
+    Parsea el formato encontrado en el archivo Gastos.csv (Santander, EVO, Wizink, Amex según el ejemplo).
+    Devuelve un DataFrame estandarizado o None si hay error.
+    """
     try:
-        bytes_data = uploaded_file.getvalue()
-        try:
-            df = pd.read_csv(io.BytesIO(bytes_data), encoding='utf-8', sep=';')
-        except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(bytes_data), encoding='latin1', sep=';')
-
-        # --- Basic Cleaning & Column Handling ---
         df.columns = [col.upper().strip() for col in df.columns]
-
-        # --- Define Required Columns based on data type ---
-        if is_training_data:
-            # Training data needs these for learning structure and model
-            required_cols = ['CONCEPTO', 'CATEGORÍA', 'SUBCATEGORIA', 'IMPORTE', 'AÑO', 'MES', 'DIA']
-            # COMERCIO is highly recommended for better training but check if exists
-            if 'COMERCIO' not in df.columns:
-                st.warning("Columna 'COMERCIO' no encontrada en datos de entrenamiento. El modelo se entrenará solo con 'CONCEPTO'.")
-        else:
-            # New data MUST have these for processing and basic context
-            required_cols = ['CONCEPTO', 'IMPORTE', 'AÑO', 'MES', 'DIA']
-            # COMERCIO is optional for new data
+        required_base = ['CONCEPTO', 'IMPORTE', 'AÑO', 'MES', 'DIA']
+        required_training = ['CATEGORÍA', 'SUBCATEGORIA'] if is_training_data else []
+        required_cols = required_base + required_training
 
         missing_cols = [col for col in required_cols if col not in df.columns]
         if missing_cols:
-            st.error(f"Faltan columnas esenciales en el archivo {'de entrenamiento' if is_training_data else 'nuevo'}: {', '.join(missing_cols)}")
+            st.error(f"Formato Estándar: Faltan columnas requeridas: {', '.join(missing_cols)}")
             return None
 
-        # --- Type Conversion & Cleaning ---
-        # IMPORTE (mandatory for both now)
-        if 'IMPORTE' in df.columns:
-             try:
-                 # Ensure it's string first, replace comma, then convert to float
-                 df['IMPORTE'] = df['IMPORTE'].astype(str).str.replace(',', '.', regex=False)
-                 # Attempt conversion to numeric, coercing errors to NaN
-                 df['IMPORTE'] = pd.to_numeric(df['IMPORTE'], errors='coerce')
-                 # Check if any NaNs were produced (indicates conversion failure)
-                 if df['IMPORTE'].isnull().any():
-                      st.warning("Algunos valores en 'IMPORTE' no pudieron ser convertidos a número y serán tratados como NaN.")
-             except Exception as e:
-                 st.error(f"Error crítico al procesar la columna 'IMPORTE': {e}")
-                 return None # Stop processing if 'IMPORTE' fails critically
-        else:
-            st.error("¡Falta la columna IMPORTE!") # Should have been caught earlier, but double-check
+        df_std = pd.DataFrame()
+
+        # --- Extracción y Estandarización ---
+        df_std[CONCEPTO_STD] = df['CONCEPTO'].fillna('').astype(str).str.lower().str.strip()
+        # Usar .get para COMERCIO ya que puede no estar siempre (aunque en el formato std sí está)
+        df_std[COMERCIO_STD] = df.get('COMERCIO', pd.Series(dtype=str)).fillna('').astype(str).str.lower().str.strip()
+
+        # Importe
+        try:
+            df_std[IMPORTE_STD] = pd.to_numeric(df['IMPORTE'].astype(str).str.replace(',', '.', regex=False), errors='coerce')
+        except Exception as e:
+            st.error(f"Error convirtiendo IMPORTE en formato estándar: {e}")
             return None
 
-
-        # FECHA columns (mandatory for both)
-        date_cols = ['AÑO', 'MES', 'DIA']
-        for col in date_cols:
-             if col in df.columns:
-                try:
-                    # Convert to numeric, coerce errors, then fill potential NaNs with 0/1 and convert to int
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                    # Fill NaN with a default value (e.g., 0 for year/month/day is problematic, maybe 1 for day/month?)
-                    # A better approach might be to drop rows with invalid dates if needed.
-                    # For now, let's warn and fill with 0, then convert to Int64 to handle NaN during conversion phase.
-                    if df[col].isnull().any():
-                         st.warning(f"Valores no numéricos encontrados en '{col}'. Se intentará rellenar con 0.")
-                         df[col] = df[col].fillna(0)
-                    df[col] = df[col].astype(int) # Convert to standard integer after handling NaN
-                except Exception as e:
-                    st.error(f"Error al procesar la columna de fecha '{col}': {e}")
-                    return None
-             else:
-                  st.error(f"¡Falta la columna de fecha {col}!") # Should be caught by required_cols check
-                  return None
-
-
-        # TEXT columns (CONCEPTO mandatory, others optional/training-specific)
-        text_cols_to_process = ['CONCEPTO']
-        if 'COMERCIO' in df.columns:
-            text_cols_to_process.append('COMERCIO')
-        if is_training_data:
-            if 'CATEGORÍA' in df.columns: text_cols_to_process.append('CATEGORÍA')
-            if 'SUBCATEGORIA' in df.columns: text_cols_to_process.append('SUBCATEGORIA')
-
-        for col in text_cols_to_process:
-             if col in df.columns:
-                 df[col] = df[col].fillna('').astype(str).str.lower().str.strip()
-
-
-        # --- Feature Engineering for Model ---
-        if is_training_data:
-            # Filter rows for training (must have category)
-            df = df.dropna(subset=['CATEGORÍA'])
-            df = df[df['CATEGORÍA'] != '']
-            if df.empty:
-                st.error("El archivo de entrenamiento no tiene filas válidas con categorías después de la limpieza.")
+        # Fecha
+        for col in ['AÑO', 'MES', 'DIA']:
+            try:
+                df_std[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+            except Exception as e:
+                st.error(f"Error convirtiendo columna de fecha '{col}' en formato estándar: {e}")
                 return None
 
-            # Create training text: CONCEPTO + COMERCIO (if available)
-            if 'COMERCIO' in df.columns:
-                df['TEXTO_ENTRENAMIENTO'] = df['CONCEPTO'] + ' ' + df['COMERCIO']
-                st.session_state.training_features = ['CONCEPTO', 'COMERCIO'] # Record that COMERCIO was used
-            else:
-                df['TEXTO_ENTRENAMIENTO'] = df['CONCEPTO'] # Only CONCEPTO used
-                st.session_state.training_features = ['CONCEPTO']
-            df['TEXTO_ENTRENAMIENTO'] = df['TEXTO_ENTRENAMIENTO'].str.strip()
+        # Categorías (solo para entrenamiento)
+        if is_training_data:
+            df_std[CATEGORIA_STD] = df['CATEGORÍA'].fillna('').astype(str).str.lower().str.strip()
+            df_std[SUBCATEGORIA_STD] = df['SUBCATEGORIA'].fillna('').astype(str).str.lower().str.strip()
+            # Filtrar filas sin categoría válida para entrenamiento
+            df_std = df_std[df_std[CATEGORIA_STD] != '']
+            if df_std.empty:
+                 st.warning("Formato Estándar: No se encontraron filas con categorías válidas para entrenamiento.")
+                 # Return None o un DF vacío dependiendo de cómo quieras manejarlo arriba
+                 return pd.DataFrame() # Devolver DF vacío para concatenar sin error
 
-        else: # Processing for new data
-            # Create prediction text: Use COMERCIO only if it exists and was used in training
-            if 'COMERCIO' in df.columns and 'COMERCIO' in st.session_state.get('training_features', []):
-                 df['TEXTO_A_CATEGORIZAR'] = df['CONCEPTO'] + ' ' + df['COMERCIO']
-            else:
-                 df['TEXTO_A_CATEGORIZAR'] = df['CONCEPTO'] # Fallback to only CONCEPTO
-            df['TEXTO_A_CATEGORIZAR'] = df['TEXTO_A_CATEGORIZAR'].str.strip()
+        # Combinar texto para el modelo
+        df_std[TEXTO_MODELO] = df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]
+        df_std[TEXTO_MODELO] = df_std[TEXTO_MODELO].str.strip()
 
 
-        return df
+        # Mantener otras columnas originales si existen (opcional)
+        original_cols_to_keep = [c for c in df.columns if c.upper() not in [
+            'CONCEPTO','COMERCIO','IMPORTE','AÑO','MES','DIA',
+            'CATEGORÍA','SUBCATEGORIA','CATEGORIA','SUBCATEGORIA']] # Añadir alias si es necesario
+        for col in original_cols_to_keep:
+             df_std[f"ORIG_{col}"] = df[col] # Prefijo para evitar colisiones
+
+
+        return df_std
 
     except Exception as e:
-        st.error(f"Error general al cargar o procesar el archivo CSV: {e}")
+        st.error(f"Error inesperado parseando formato estándar: {e}")
         return None
 
-# --- extract_knowledge and train_classifier functions remain largely the same ---
-# (Make sure train_classifier uses 'TEXTO_ENTRENAMIENTO')
+# --- Aquí añadirías las funciones parse_evo, parse_wizink, parse_amex ---
+# --- si tuvieran formatos *REALMENTE* diferentes. Por ahora, asumimos ---
+# --- que todos los ejemplos en Gastos.csv usan el mismo formato. ---
+
+# Ejemplo placeholder (si EVO fuera diferente):
+# def parse_evo(df, is_training_data=True):
+#     st.info("Parseando formato específico de EVO...")
+#     # ... lógica específica para columnas de EVO ...
+#     df_std = pd.DataFrame()
+#     # ... mapear columnas de EVO a df_std[CONCEPTO_STD], df_std[IMPORTE_STD], etc. ...
+#     # ... manejar fechas, importes, etc. como en parse_standard_format ...
+#     # ... crear df_std[TEXTO_MODELO] ...
+#     return df_std
+
+# --- Función Principal de Carga y Estandarización ---
+
+# @st.cache_data # Cachear puede ser complejo con múltiples archivos y bancos
+def load_and_standardize(uploaded_file_info, bank_type, is_training_data=True):
+    """
+    Lee un archivo subido, llama al parser correcto y devuelve el DF estandarizado.
+    uploaded_file_info es un objeto File Uploader de Streamlit.
+    """
+    file_name = uploaded_file_info.name
+    st.write(f"Procesando archivo: {file_name} (Banco: {bank_type})")
+
+    try:
+        bytes_data = uploaded_file_info.getvalue()
+        try:
+            # Intentar leer con diferentes encodings y separadores si es necesario
+            df_raw = pd.read_csv(io.BytesIO(bytes_data), encoding='utf-8', sep=';')
+        except UnicodeDecodeError:
+            df_raw = pd.read_csv(io.BytesIO(bytes_data), encoding='latin1', sep=';')
+        except Exception as read_err: # Captura otros errores de lectura
+             st.error(f"No se pudo leer el CSV '{file_name}'. ¿Está bien formado y usa ';' como separador? Error: {read_err}")
+             return None
+
+        # Llamar a la función de parseo específica
+        if bank_type == "SANTANDER" or bank_type == "EVO" or bank_type == "WIZINK" or bank_type == "AMEX":
+            # En este caso, todos usan el mismo parser basado en Gastos.csv
+            df_standard = parse_standard_format(df_raw.copy(), is_training_data)
+        # elif bank_type == "OTRO_BANCO":
+        #     df_standard = parse_otro_banco(df_raw.copy(), is_training_data)
+        else:
+            st.error(f"Tipo de banco '{bank_type}' no reconocido o sin parser definido.")
+            return None
+
+        if df_standard is None:
+            st.error(f"Fallo al parsear el archivo: {file_name}")
+            return None
+        elif df_standard.empty and is_training_data:
+             st.warning(f"El archivo de entrenamiento {file_name} no produjo datos válidos tras el parseo.")
+             return df_standard # Devolver vacío para que no rompa la concatenación
+        elif df_standard.empty and not is_training_data:
+             st.error(f"El archivo nuevo {file_name} no produjo datos válidos tras el parseo.")
+             return None
+
+        st.success(f"Archivo '{file_name}' parseado y estandarizado.")
+        return df_standard
+
+    except Exception as e:
+        st.error(f"Error procesando '{file_name}': {e}")
+        return None
+
+
+# --- Funciones de ML (extract_knowledge, train_classifier) ---
+#     (Estas funciones ahora operan sobre el DataFrame ESTANDARIZADO
+#      usando las columnas _STD y TEXTO_MODELO)
+
 @st.cache_data
-def extract_knowledge(df):
-    """Extrae categorías, subcategorías y comercios del DataFrame de entrenamiento."""
+def extract_knowledge_std(df_std):
     knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
-    if df is None or 'CATEGORÍA' not in df.columns:
+    if df_std is None or CATEGORIA_STD not in df_std.columns or df_std.empty:
         return knowledge
 
-    knowledge['categorias'] = sorted([cat for cat in df['CATEGORÍA'].dropna().unique() if cat])
+    knowledge['categorias'] = sorted([cat for cat in df_std[CATEGORIA_STD].dropna().unique() if cat])
 
     for cat in knowledge['categorias']:
-        # Subcategorías
-        subcat_col = 'SUBCATEGORIA'
-        if subcat_col in df.columns:
-             subcats_series = df.loc[df['CATEGORÍA'] == cat, subcat_col].dropna()
-             subcats_series = subcats_series[subcats_series != '']
-             knowledge['subcategorias'][cat] = sorted(subcats_series.unique().tolist())
+        subcat_col = SUBCATEGORIA_STD
+        if subcat_col in df_std.columns:
+             subcats_series = df_std.loc[df_std[CATEGORIA_STD] == cat, subcat_col].dropna()
+             knowledge['subcategorias'][cat] = sorted([s for s in subcats_series.unique() if s])
         else:
              knowledge['subcategorias'][cat] = []
 
-        # Comercios
-        comercio_col = 'COMERCIO'
-        if comercio_col in df.columns:
-             comers_series = df.loc[df['CATEGORÍA'] == cat, comercio_col].dropna()
-             comers_series = comers_series[comers_series.str.strip() != '']
-             comers_list = sorted([com for com in comers_series.unique() if com != 'n/a'])
+        comercio_col = COMERCIO_STD
+        if comercio_col in df_std.columns:
+             comers_series = df_std.loc[df_std[CATEGORIA_STD] == cat, comercio_col].dropna()
+             comers_list = sorted([com for com in comers_series.unique() if com and com != 'n/a'])
              knowledge['comercios'][cat] = comers_list
         else:
             knowledge['comercios'][cat] = []
-
     return knowledge
 
-@st.cache_resource # Cache model and vectorizer objects
-def train_classifier(df):
-    """Entrena el modelo de clasificación usando TEXTO_ENTRENAMIENTO."""
+@st.cache_resource
+def train_classifier_std(df_std):
     report = "Modelo no entrenado."
     model = None
     vectorizer = None
 
-    if df is None or df.empty or 'TEXTO_ENTRENAMIENTO' not in df.columns or 'CATEGORÍA' not in df.columns:
-        st.warning("No hay datos válidos (TEXTO_ENTRENAMIENTO, CATEGORÍA) para entrenar.")
+    required_cols = [TEXTO_MODELO, CATEGORIA_STD]
+    if df_std is None or df_std.empty or not all(col in df_std.columns for col in required_cols):
+        st.warning("No hay datos estandarizados válidos (TEXTO_MODELO, CATEGORIA_STD) para entrenar.")
         return model, vectorizer, report
 
-    df_train = df.dropna(subset=['TEXTO_ENTRENAMIENTO', 'CATEGORÍA'])
-    df_train = df_train[df_train['CATEGORÍA'] != '']
+    df_train = df_std.dropna(subset=required_cols)
+    df_train = df_train[df_train[CATEGORIA_STD] != '']
 
-    if df_train.empty or len(df_train['CATEGORÍA'].unique()) < 2:
-        st.warning("Datos insuficientes o pocas categorías (<2) para entrenar.")
+    if df_train.empty or len(df_train[CATEGORIA_STD].unique()) < 2:
+        st.warning("Datos insuficientes o pocas categorías (<2) en datos estandarizados para entrenar.")
         return model, vectorizer, report
 
     try:
-        X = df_train['TEXTO_ENTRENAMIENTO'] # Use the combined training text
-        y = df_train['CATEGORÍA']
+        X = df_train[TEXTO_MODELO]
+        y = df_train[CATEGORIA_STD] # Usar la categoría estandarizada
 
+        # (Split logic - unchanged conceptually)
         unique_classes = y.unique()
         test_available = False
         if len(unique_classes) > 1 and len(y) > 5:
@@ -205,18 +232,19 @@ def train_classifier(df):
                 test_available = True
             except ValueError:
                 X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                test_available = True # Still split, just not stratified
+                test_available = True
         else:
             X_train, y_train = X, y
             X_test, y_test = pd.Series(dtype='str'), pd.Series(dtype='str')
-            st.info("Usando todos los datos para entrenar (sin evaluación detallada).")
+            st.info("Usando todos los datos estandarizados para entrenar.")
 
+        # Train
         vectorizer = TfidfVectorizer()
         X_train_vec = vectorizer.fit_transform(X_train)
-
         model = MultinomialNB()
         model.fit(X_train_vec, y_train)
 
+        # Report (if possible)
         if test_available and not X_test.empty:
             try:
                 X_test_vec = vectorizer.transform(X_test)
@@ -224,117 +252,184 @@ def train_classifier(df):
                 labels = sorted(list(set(y_test) | set(y_pred)))
                 report = classification_report(y_test, y_pred, labels=labels, zero_division=0)
             except Exception as report_err:
-                st.warning(f"Error generando reporte de clasificación: {report_err}")
-                report = "Modelo entrenado, pero no se pudo generar el reporte."
+                 report = f"Modelo entrenado, error en reporte: {report_err}"
         else:
-            report = "Modelo entrenado con todos los datos disponibles."
+            report = "Modelo entrenado con todos los datos estandarizados."
 
-        st.success("¡Modelo entrenado exitosamente!")
+        st.success("¡Modelo entrenado con datos estandarizados!")
 
     except Exception as e:
-        st.error(f"Error durante el entrenamiento: {e}")
+        st.error(f"Error durante el entrenamiento con datos estandarizados: {e}")
         report = f"Error en entrenamiento: {e}"
 
     return model, vectorizer, report
 
-
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
-st.title("📊 Categorizador de Transacciones Bancarias v3")
+st.title("🏦 Categorizador Bancario Multi-Formato")
 
-st.info("💡 **Instrucciones:** Primero carga tu archivo CSV histórico **ya categorizado** (como `Gastos.csv`) para entrenar el sistema. Luego, podrás cargar un **nuevo** archivo CSV (sin categorizar) para que la aplicación le asigne categorías.")
+st.info("""
+**Instrucciones:**
+1.  **Entrenar:** Selecciona el banco, sube tus archivos CSV **categorizados** de ese banco. Repite si tienes de varios bancos. Luego presiona "Entrenar Modelo".
+2.  **Categorizar:** Una vez entrenado, selecciona el banco y sube tus archivos CSV **nuevos (sin categorizar)**. Los resultados aparecerán abajo.
+""")
 
-st.header("Paso 1: Entrenar con Datos Históricos")
-st.write("Sube tu archivo CSV **con categorías ya asignadas** (columnas requeridas: `CONCEPTO`, `CATEGORÍA`, `SUBCATEGORIA`, `IMPORTE`, `AÑO`, `MES`, `DIA`). Se recomienda incluir `COMERCIO` para mejor precisión.")
+# --- Paso 1: Entrenamiento ---
+st.header("Paso 1: Entrenar Modelo con Datos Históricos")
 
-uploaded_training_file = st.file_uploader("Carga tu archivo CSV de ENTRENAMIENTO", type="csv", key="trainer_v3")
+bank_options = ["SANTANDER", "EVO", "WIZINK", "AMEX"] # Añade más bancos aquí si creas parsers
+selected_bank_train = st.selectbox("Selecciona el Banco del Archivo de Entrenamiento:", bank_options, key="bank_train")
 
-if uploaded_training_file:
-    df_train = load_and_process_data(uploaded_training_file, is_training_data=True)
+uploaded_training_files = st.file_uploader(
+    f"Carga archivo(s) CSV CATEGORIZADOS de {selected_bank_train}",
+    type="csv",
+    accept_multiple_files=True,
+    key="trainer_multi"
+)
 
-    if df_train is not None:
-        st.sidebar.success("Archivo de entrenamiento cargado.")
-        # Extract knowledge and store it
-        st.session_state.knowledge = extract_knowledge(df_train)
+# Botón para añadir archivos al conjunto de entrenamiento acumulado
+if uploaded_training_files:
+    if st.button(f"Añadir Archivos de {selected_bank_train} al Entrenamiento", key="add_train"):
+        if 'processed_training_data' not in st.session_state:
+            st.session_state.processed_training_data = pd.DataFrame()
 
-        # Display knowledge in sidebar
-        st.sidebar.subheader("Conocimiento Aprendido")
-        with st.sidebar.expander("Ver Categorías"):
-            st.write(st.session_state.knowledge['categorias'])
-        with st.sidebar.expander("Ver Comercios"):
-             st.json(st.session_state.knowledge['comercios'], expanded=False)
+        processed_list = []
+        for file in uploaded_training_files:
+            df_std = load_and_standardize(file, selected_bank_train, is_training_data=True)
+            if df_std is not None and not df_std.empty:
+                processed_list.append(df_std)
 
-        # Train model and store results
-        st.session_state.model, st.session_state.vectorizer, st.session_state.report_string = train_classifier(df_train.copy())
+        if processed_list:
+            current_data = st.session_state.processed_training_data
+            new_data = pd.concat(processed_list, ignore_index=True)
+            st.session_state.processed_training_data = pd.concat([current_data, new_data], ignore_index=True)
+            st.success(f"{len(processed_list)} archivo(s) de {selected_bank_train} añadidos. Total filas para entrenar: {len(st.session_state.processed_training_data)}")
+            # Limpiar uploader para evitar re-procesar al presionar de nuevo accidentalmente
+            # st.experimental_rerun() # O una forma más moderna de resetear el uploader si existe
 
-        if st.session_state.model and st.session_state.vectorizer:
-            st.session_state.model_trained = True
-            st.sidebar.subheader("Resultado Entrenamiento")
-            with st.sidebar.expander("Ver Informe de Clasificación", expanded=False):
-                 st.text(st.session_state.report_string)
         else:
-            st.session_state.model_trained = False
-            st.sidebar.error("Fallo en el entrenamiento del modelo.")
-            st.session_state.report_string = "Entrenamiento fallido." # Update status
+            st.warning("No se procesaron archivos válidos en esta carga.")
 
-# Separator
-st.divider()
+# Mostrar resumen de datos acumulados para entrenar
+if not st.session_state.processed_training_data.empty:
+    st.write("Datos Acumulados para Entrenamiento (primeras filas):")
+    st.dataframe(st.session_state.processed_training_data.head())
 
-st.header("Paso 2: Categorizar Nuevo Archivo")
+    # Botón para entrenar el modelo una vez que hay datos
+    if st.button("🧠 Entrenar Modelo con Datos Acumulados", key="train_button"):
+        with st.spinner("Entrenando modelo..."):
+            df_train_final = st.session_state.processed_training_data.copy()
+            # Extraer conocimiento ANTES de entrenar
+            st.session_state.knowledge = extract_knowledge_std(df_train_final)
 
-# Check if model is ready before allowing upload of new file
-if not st.session_state.model_trained:
-    st.warning("⚠️ Primero debes cargar y procesar un archivo de entrenamiento válido en el Paso 1.")
+            # Entrenar
+            st.session_state.model, st.session_state.vectorizer, st.session_state.report_string = train_classifier_std(df_train_final)
+
+            if st.session_state.model and st.session_state.vectorizer:
+                st.session_state.model_trained = True
+                st.success("Modelo entrenado y listo para usar.")
+                # Mostrar conocimiento y reporte en sidebar
+                st.sidebar.success("Modelo Entrenado")
+                st.sidebar.subheader("Conocimiento")
+                with st.sidebar.expander("Categorías"): st.write(st.session_state.knowledge['categorias'])
+                with st.sidebar.expander("Comercios"): st.json(st.session_state.knowledge['comercios'])
+                st.sidebar.subheader("Evaluación")
+                with st.sidebar.expander("Informe Detallado"): st.text(st.session_state.report_string)
+            else:
+                st.session_state.model_trained = False
+                st.error("Fallo en el entrenamiento.")
+                st.sidebar.error("Entrenamiento Fallido")
+                st.sidebar.text(st.session_state.report_string) # Mostrar el error
 else:
-    st.write("Sube tu **nuevo** archivo CSV (columnas requeridas: `CONCEPTO`, `IMPORTE`, `AÑO`, `MES`, `DIA`. La columna `COMERCIO` es opcional pero ayuda si existe).")
-    uploaded_new_file = st.file_uploader("Carga tu archivo CSV NUEVO a categorizar", type="csv", key="categorizer_v3")
+    st.info("Sube archivos de entrenamiento y presiona 'Añadir...' para empezar.")
 
-    if uploaded_new_file:
-        df_new = load_and_process_data(uploaded_new_file, is_training_data=False)
 
-        if df_new is not None and 'TEXTO_A_CATEGORIZAR' in df_new.columns:
-            st.success("Archivo nuevo cargado.")
-            st.subheader("Vista Previa del Archivo Nuevo (Antes)")
-            st.dataframe(df_new.head())
+# --- Paso 2: Categorización ---
+st.divider()
+st.header("Paso 2: Categorizar Nuevos Archivos")
 
+if not st.session_state.model_trained:
+    st.warning("⚠️ El modelo aún no ha sido entrenado (Ver Paso 1).")
+else:
+    selected_bank_predict = st.selectbox("Selecciona el Banco del Nuevo Archivo:", bank_options, key="bank_predict")
+
+    uploaded_new_files = st.file_uploader(
+        f"Carga archivo(s) CSV NUEVOS de {selected_bank_predict} (sin categorizar)",
+        type="csv",
+        accept_multiple_files=True,
+        key="categorizer_multi"
+    )
+
+    if uploaded_new_files:
+         # Reset previous results when new files are uploaded
+        st.session_state.categorized_data_list = []
+
+        all_new_std_dfs = []
+        processing_success = True
+        for file in uploaded_new_files:
+             df_new_std = load_and_standardize(file, selected_bank_predict, is_training_data=False)
+             if df_new_std is not None and not df_new_std.empty and TEXTO_MODELO in df_new_std.columns:
+                  all_new_std_dfs.append((file.name, df_new_std)) # Guardar nombre y df
+             elif df_new_std is not None and (df_new_std.empty or TEXTO_MODELO not in df_new_std.columns):
+                  st.warning(f"Archivo '{file.name}' no contiene datos válidos o la columna {TEXTO_MODELO} tras estandarizar. Se omitirá.")
+             else:
+                  st.error(f"No se pudo procesar el archivo '{file.name}'.")
+                  processing_success = False # Marcar que hubo un error
+
+        if all_new_std_dfs and processing_success:
+            st.subheader("Resultados de la Categorización:")
             try:
-                # Apply the trained vectorizer and model from session state
-                X_new_vec = st.session_state.vectorizer.transform(df_new['TEXTO_A_CATEGORIZAR'])
-                predictions = st.session_state.model.predict(X_new_vec)
+                with st.spinner("Aplicando categorización..."):
+                     for file_name, df_to_categorize in all_new_std_dfs:
+                          # Asegurarse de que TEXTO_MODELO existe y no tiene NaNs
+                          df_to_categorize = df_to_categorize.dropna(subset=[TEXTO_MODELO])
+                          if not df_to_categorize.empty:
+                            X_new_vec = st.session_state.vectorizer.transform(df_to_categorize[TEXTO_MODELO])
+                            predictions = st.session_state.model.predict(X_new_vec)
+                            df_to_categorize[CATEGORIA_PREDICHA] = predictions.astype(str).str.capitalize()
 
-                # Add the prediction column
-                df_new['CATEGORIA_PREDICHA'] = predictions
-                # Capitalize for display
-                df_new['CATEGORIA_PREDICHA'] = df_new['CATEGORIA_PREDICHA'].str.capitalize()
+                            # Guardar el resultado con su nombre original
+                            st.session_state.categorized_data_list.append({'name': file_name, 'data': df_to_categorize})
+                          else:
+                               st.warning(f"No quedaron filas válidas en '{file_name}' después de limpiar NAs en {TEXTO_MODELO}.")
 
-                # --- (Optional) Predict Subcategory (Simple Placeholder) ---
-                # This needs a separate, potentially more complex model or rule-based system
-                # For now, we focus on the main category prediction.
-                # df_new['SUBCATEGORIA_PREDICHA'] = "Pendiente"
-
-                st.subheader("Resultado de la Categorización")
-                # Select columns to display, putting predicted category prominently
-                display_cols = ['CATEGORIA_PREDICHA'] + [col for col in df_new.columns if col != 'CATEGORIA_PREDICHA' and col != 'TEXTO_A_CATEGORIZAR']
-                st.dataframe(df_new[display_cols])
-
-                # Download Button
-                csv_output = df_new.to_csv(index=False, sep=';', decimal=',').encode('utf-8') # Use comma decimal for Excel Spain
-                st.download_button(
-                    label="📥 Descargar CSV Categorizado",
-                    data=csv_output,
-                    file_name='gastos_categorizados.csv',
-                    mime='text/csv',
-                )
 
             except Exception as e:
-                st.error(f"Error al aplicar la categorización: {e}")
-                st.error("Verifica que el archivo nuevo tenga las columnas requeridas (`CONCEPTO`, `IMPORTE`, `AÑO`, `MES`, `DIA`) y un formato consistente.")
+                 st.error(f"Error al aplicar la categorización: {e}")
+                 st.error("Asegúrate de que los nuevos archivos tengan un formato consistente con los datos de entrenamiento (especialmente CONCEPTO y COMERCIO si se usó).")
 
-        elif df_new is not None:
-             st.error("No se encontró la columna combinada 'TEXTO_A_CATEGORIZAR' necesaria para la predicción después del procesamiento.")
+
+# --- Mostrar y Descargar Resultados ---
+if st.session_state.categorized_data_list:
+     st.success("¡Categorización completada!")
+     for result in st.session_state.categorized_data_list:
+          file_name = result['name']
+          df_result = result['data']
+
+          st.write(f"**Archivo:** `{file_name}`")
+          # Mostrar columnas relevantes
+          display_cols = [CATEGORIA_PREDICHA, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
+          if COMERCIO_STD in df_result.columns: display_cols.insert(2, COMERCIO_STD)
+          # Añadir columnas originales si existen
+          orig_cols = [c for c in df_result.columns if c.startswith('ORIG_')]
+          display_cols.extend(orig_cols)
+
+          st.dataframe(df_result[display_cols])
+
+          # Botón de descarga para CADA archivo
+          csv_output = df_result.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
+          st.download_button(
+              label=f"📥 Descargar '{file_name}' Categorizado",
+              data=csv_output,
+              file_name=f"categorizado_{file_name}",
+              mime='text/csv',
+              key=f"download_{file_name}" # Clave única para cada botón
+          )
+     st.divider()
+
 
 # Sidebar Info
 st.sidebar.header("Acerca de")
 st.sidebar.info(
-    "Esta aplicación aprende de tus gastos históricos categorizados y luego aplica ese aprendizaje para sugerir categorías a nuevas transacciones."
+    "Sube archivos CSV de diferentes bancos. Entrena el modelo con datos históricos categorizados. Luego, categoriza nuevos archivos no etiquetados."
 )
