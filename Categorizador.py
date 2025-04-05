@@ -410,74 +410,77 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
 
 # --- Fase 3: Categorización ---
 with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
-    if not st.session_state.model_trained:
+    # Condiciones para mostrar la fase de categorización:
+    # 1. El modelo debe estar entrenado
+    # 2. Debe haber mapeos disponibles (ya sea aprendidos o cargados)
+    model_ready = st.session_state.get('model_trained', False)
+    mappings_available = bool(st.session_state.get('bank_mappings', {})) # True si el dict no está vacío
+
+    if not model_ready:
         st.warning("⚠️ Modelo no entrenado (Ver Fase 1).")
-    elif not st.session_state.bank_mappings:
-        st.warning("⚠️ No se han aprendido/cargado formatos bancarios (Ver Fase 2).")
-    else:
+    elif not mappings_available:
+        # Esta advertencia SÓLO se muestra si NO hay mapeos en memoria
+        st.warning("⚠️ No se han aprendido o cargado formatos bancarios (Ver Fase 2).")
+    else: # Modelo entrenado Y mapeos disponibles
         st.write("Selecciona el banco y sube el archivo CSV **sin categorizar** que deseas procesar.")
         available_banks_for_pred = list(st.session_state.bank_mappings.keys())
-        if not available_banks_for_pred:
-             st.warning("No hay mapeos disponibles.")
-        else:
-            selected_bank_predict = st.selectbox("Banco del Nuevo Archivo:", available_banks_for_pred, key="bank_predict_f3")
+        # No necesitamos el if not available_banks_for_pred aquí porque ya lo comprobamos arriba
 
-            uploaded_final_file = st.file_uploader(f"Cargar archivo CSV NUEVO de {selected_bank_predict}", type="csv", key="final_uploader_f3")
+        selected_bank_predict = st.selectbox("Banco del Nuevo Archivo:", available_banks_for_pred, key="bank_predict_f3")
 
-            if uploaded_final_file and selected_bank_predict:
-                mapping_to_use = st.session_state.bank_mappings.get(selected_bank_predict)
-                if not mapping_to_use:
-                     st.error(f"Error interno: No se encontró el mapeo para {selected_bank_predict}.")
-                else:
-                     st.write(f"Procesando '{uploaded_final_file.name}'...")
-                     df_std_new = None
-                     with st.spinner(f"Estandarizando datos..."):
-                          df_raw_new, _ = read_sample_csv(uploaded_final_file)
-                          if df_raw_new is not None:
-                              df_std_new = standardize_data_with_mapping(df_raw_new.copy(), mapping_to_use)
-                          else: st.error(f"No se pudo leer: {uploaded_final_file.name}")
+        uploaded_final_file = st.file_uploader(f"Cargar archivo CSV NUEVO de {selected_bank_predict}", type="csv", key="final_uploader_f3")
 
-                     if df_std_new is not None and not df_std_new.empty:
-                          st.success("Datos estandarizados.")
-                          with st.spinner("Aplicando modelo..."):
-                              try:
-                                   if TEXTO_MODELO not in df_std_new.columns:
-                                       st.error(f"Error: Falta {TEXTO_MODELO} tras estandarizar.")
-                                   else:
-                                        df_pred = df_std_new.dropna(subset=[TEXTO_MODELO]).copy()
-                                        if not df_pred.empty:
-                                             X_new_vec = st.session_state.vectorizer.transform(df_pred[TEXTO_MODELO])
-                                             predictions = st.session_state.model.predict(X_new_vec)
+        if uploaded_final_file and selected_bank_predict:
+            mapping_to_use = st.session_state.bank_mappings.get(selected_bank_predict)
+            if not mapping_to_use:
+                 st.error(f"Error interno: No se encontró el mapeo para {selected_bank_predict}.")
+            else:
+                 st.write(f"Procesando '{uploaded_final_file.name}'...")
+                 df_std_new = None
+                 with st.spinner(f"Estandarizando datos..."):
+                      df_raw_new, _ = read_sample_csv(uploaded_final_file)
+                      if df_raw_new is not None:
+                          df_std_new = standardize_data_with_mapping(df_raw_new.copy(), mapping_to_use)
+                      else: st.error(f"No se pudo leer: {uploaded_final_file.name}")
 
-                                             # *** CORRECCIÓN APLICADA ***
-                                             capitalized_predictions = [str(p).capitalize() for p in predictions]
-                                             df_pred[CATEGORIA_PREDICHA] = capitalized_predictions
-                                             # *** FIN CORRECCIÓN ***
+                 if df_std_new is not None and not df_std_new.empty:
+                      st.success("Datos estandarizados.")
+                      with st.spinner("Aplicando modelo..."):
+                          try:
+                               if TEXTO_MODELO not in df_std_new.columns:
+                                   st.error(f"Error: Falta {TEXTO_MODELO} tras estandarizar.")
+                               else:
+                                    df_pred = df_std_new.dropna(subset=[TEXTO_MODELO]).copy()
+                                    if not df_pred.empty:
+                                         X_new_vec = st.session_state.vectorizer.transform(df_pred[TEXTO_MODELO])
+                                         predictions = st.session_state.model.predict(X_new_vec)
+                                         capitalized_predictions = [str(p).capitalize() for p in predictions]
+                                         df_pred[CATEGORIA_PREDICHA] = capitalized_predictions
 
-                                             st.subheader("📊 Resultados")
-                                             display_cols = [CATEGORIA_PREDICHA, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
-                                             if COMERCIO_STD in df_pred.columns: display_cols.insert(2, COMERCIO_STD)
-                                             orig_cols = [c for c in df_pred.columns if c.startswith('ORIG_')]
-                                             display_cols.extend(orig_cols)
-                                             final_display_cols = [col for col in display_cols if col in df_pred.columns]
-                                             st.dataframe(df_pred[final_display_cols])
+                                         st.subheader("📊 Resultados")
+                                         display_cols = [CATEGORIA_PREDICHA, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
+                                         if COMERCIO_STD in df_pred.columns: display_cols.insert(2, COMERCIO_STD)
+                                         orig_cols = [c for c in df_pred.columns if c.startswith('ORIG_')]
+                                         display_cols.extend(orig_cols)
+                                         final_display_cols = [col for col in display_cols if col in df_pred.columns]
+                                         st.dataframe(df_pred[final_display_cols])
 
-                                             csv_output = df_pred.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
-                                             st.download_button(
-                                                  label=f"📥 Descargar '{uploaded_final_file.name}' Categorizado",
-                                                  data=csv_output, file_name=f"categorizado_{uploaded_final_file.name}",
-                                                  mime='text/csv', key=f"download_final_{uploaded_final_file.name}"
-                                             )
-                                        else: st.warning("No quedaron filas válidas para categorizar.")
-                              except AttributeError as ae_inner:
-                                   st.error(f"Error de Atributo (interno): {ae_inner}"); st.error(traceback.format_exc())
-                              except Exception as e_pred:
-                                   st.error(f"Error durante la predicción: {e_pred}"); st.error(traceback.format_exc())
+                                         csv_output = df_pred.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
+                                         st.download_button(
+                                              label=f"📥 Descargar '{uploaded_final_file.name}' Categorizado",
+                                              data=csv_output, file_name=f"categorizado_{uploaded_final_file.name}",
+                                              mime='text/csv', key=f"download_final_{uploaded_final_file.name}"
+                                         )
+                                    else: st.warning("No quedaron filas válidas para categorizar.")
+                          except AttributeError as ae_inner:
+                               st.error(f"Error de Atributo (interno): {ae_inner}"); st.error(traceback.format_exc())
+                          except Exception as e_pred:
+                               st.error(f"Error durante la predicción: {e_pred}"); st.error(traceback.format_exc())
 
-                     elif df_std_new is not None and df_std_new.empty:
-                         st.warning("Archivo vacío o sin datos válidos tras estandarizar.")
-                     else:
-                         st.error("Fallo en la estandarización usando el mapeo.")
+                 elif df_std_new is not None and df_std_new.empty:
+                     st.warning("Archivo vacío o sin datos válidos tras estandarizar.")
+                 else:
+                     st.error("Fallo en la estandarización usando el mapeo.")
 
 # Sidebar Info
 st.sidebar.divider()
@@ -487,3 +490,15 @@ st.sidebar.info(
     "2. Enseña/Carga los formatos de tus bancos. Guarda la configuración. "
     "3. Sube nuevos archivos para categorizarlos."
 )
+# Mostrar estado actual en Sidebar
+st.sidebar.divider()
+st.sidebar.subheader("Estado Actual")
+if st.session_state.get('model_trained', False):
+    st.sidebar.success("✅ Modelo Entrenado")
+else:
+    st.sidebar.warning("❌ Modelo NO Entrenado")
+
+if st.session_state.get('bank_mappings', {}):
+    st.sidebar.success(f"✅ Mapeos Cargados/Guardados ({len(st.session_state.bank_mappings)} bancos)")
+else:
+    st.sidebar.warning("❌ Sin Mapeos Bancarios")
