@@ -9,7 +9,7 @@ import numpy as np
 from datetime import datetime
 import json # Para guardar/cargar mapeos
 import traceback # Para imprimir errores detallados
-import os # Para manejo de archivos (aunque no guardaremos en servidor)
+import os
 
 # --- Constantes de Columnas Estándar Internas ---
 CONCEPTO_STD = 'CONCEPTO_STD'
@@ -18,29 +18,113 @@ IMPORTE_STD = 'IMPORTE_STD'
 AÑO_STD = 'AÑO'
 MES_STD = 'MES'
 DIA_STD = 'DIA'
-FECHA_STD = 'FECHA_STD' # Usaremos una columna de fecha estándar internamente
+FECHA_STD = 'FECHA_STD'
 CATEGORIA_STD = 'CATEGORIA_STD'
 SUBCATEGORIA_STD = 'SUBCATEGORIA_STD'
-TEXTO_MODELO = 'TEXTO_MODELO' # Columna combinada para el modelo
+TEXTO_MODELO = 'TEXTO_MODELO'
 CATEGORIA_PREDICHA = 'CATEGORIA_PREDICHA'
-
-# Columnas estándar que NECESITAMOS mapear desde los archivos bancarios
-MANDATORY_STD_COLS = [CONCEPTO_STD, IMPORTE_STD, FECHA_STD] # Fecha se maneja AÑO/MES/DIA o FECHA_STD
-OPTIONAL_STD_COLS = [COMERCIO_STD] # Comercio es opcional en el archivo de origen
-CONFIG_FILENAME = "Configuracion_Mapeo_Bancos.json" # Nombre estándar para el archivo de config
+MANDATORY_STD_COLS = [CONCEPTO_STD, IMPORTE_STD, FECHA_STD]
+OPTIONAL_STD_COLS = [COMERCIO_STD]
+CONFIG_FILENAME = "Configuracion_Mapeo_Bancos.json"
 
 # --- Session State Initialization ---
+# ... (igual que antes) ...
 if 'model_trained' not in st.session_state: st.session_state.model_trained = False
 if 'model' not in st.session_state: st.session_state.model = None
 if 'vectorizer' not in st.session_state: st.session_state.vectorizer = None
 if 'knowledge' not in st.session_state: st.session_state.knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
 if 'bank_mappings' not in st.session_state: st.session_state.bank_mappings = {}
 if 'training_report' not in st.session_state: st.session_state.training_report = "Modelo no entrenado."
-# Para evitar reprocesar config cargada en reruns automáticos
 if 'config_loader_processed_id' not in st.session_state: st.session_state.config_loader_processed_id = None
 
-# --- Funciones (Parseo, ML, Estandarización) ---
+# --- Funciones ---
 
+# **** MODIFICACIÓN IMPORTANTE AQUÍ ****
+@st.cache_data
+def read_uploaded_file(uploaded_file):
+    """
+    Lee un archivo CSV o Excel subido y devuelve un DataFrame y sus columnas.
+    Maneja la detección del tipo de archivo.
+    """
+    if uploaded_file is None:
+        return None, []
+    try:
+        file_name = uploaded_file.name
+        bytes_data = uploaded_file.getvalue()
+        df = None
+        detected_columns = []
+
+        st.write(f"Debug (read_uploaded_file): Procesando '{file_name}'") # Debug
+
+        if file_name.lower().endswith('.csv'):
+            st.write("Debug: Detectado CSV.") # Debug
+            # --- Lógica de lectura CSV ---
+            sniffer_content = bytes_data.decode('utf-8', errors='replace')
+            sniffer = io.StringIO(sniffer_content)
+            sep = ';' # Default
+            try:
+                sample_data = sniffer.read(min(1024 * 20, len(sniffer_content)))
+                if sample_data:
+                     dialect = pd.io.parsers.readers.csv.Sniffer().sniff(sample_data)
+                     if dialect.delimiter in [',', ';', '\t', '|']: sep = dialect.delimiter
+                #else: # Archivo vacío detectado por sniffer
+                     #st.error(f"Archivo CSV '{file_name}' parece vacío.")
+                     #return None, []
+            except Exception: pass # Usar default sep
+
+            try:
+                df = pd.read_csv(io.BytesIO(bytes_data), encoding='utf-8', sep=sep, low_memory=False)
+            except UnicodeDecodeError:
+                df = pd.read_csv(io.BytesIO(bytes_data), encoding='latin1', sep=sep, low_memory=False)
+            except Exception as read_err:
+                 st.error(f"Error leyendo CSV '{file_name}' con separador '{sep}': {read_err}")
+                 return None, []
+
+        elif file_name.lower().endswith(('.xlsx', '.xls')):
+            st.write("Debug: Detectado Excel.") # Debug
+            # --- Lógica de lectura Excel ---
+            try:
+                # Leer la primera hoja por defecto, usar openpyxl
+                df = pd.read_excel(io.BytesIO(bytes_data), engine='openpyxl')
+                st.info(f"Archivo Excel '{file_name}' leído (primera hoja).")
+            except ImportError:
+                 st.error("Se necesita 'openpyxl' para leer .xlsx. Instálalo (`pip install openpyxl`) y reinicia.")
+                 return None, []
+            except Exception as read_excel_err:
+                st.error(f"Error leyendo archivo Excel '{file_name}': {read_excel_err}")
+                # Podrías intentar con 'xlrd' para .xls antiguos si es necesario,
+                # pero openpyxl maneja ambos en versiones recientes de pandas.
+                return None, []
+        else:
+            st.error(f"Formato de archivo no soportado: '{file_name}'. Sube .csv, .xlsx o .xls.")
+            return None, []
+
+        # --- Procesamiento común post-lectura ---
+        if df is not None:
+            if df.empty:
+                 st.warning(f"El archivo '{file_name}' parece no contener datos después de la lectura.")
+                 # Devolver DF vacío pero con columnas si existen, o lista vacía
+                 detected_columns = [str(col).strip() for col in df.columns] if hasattr(df, 'columns') else []
+                 return df, detected_columns
+
+            original_columns = df.columns.tolist()
+            # Limpiar nombres de columna (importante para mapeo)
+            df.columns = [str(col).strip() for col in original_columns]
+            detected_columns = df.columns.tolist()
+            st.write(f"Debug: Columnas detectadas y limpiadas: {detected_columns}") # Debug
+            return df, detected_columns
+        else:
+            # Si df sigue siendo None, algo falló arriba
+            return None, []
+
+    except Exception as e:
+        st.error(f"Error general leyendo archivo '{uploaded_file.name if uploaded_file else 'desconocido'}': {e}")
+        st.error(traceback.format_exc())
+        return None, []
+# **** FIN MODIFICACIÓN IMPORTANTE ****
+
+
+# --- parse_historic_categorized (sin cambios, opera sobre el DF leído) ---
 def parse_historic_categorized(df_raw):
     """Parsea el Gastos.csv inicial para entrenamiento."""
     try:
@@ -93,32 +177,7 @@ def parse_historic_categorized(df_raw):
         return df_std
     except Exception as e: st.error(f"Error Gral parseando histórico: {e}"); st.error(traceback.format_exc()); return None
 
-@st.cache_data
-def read_sample_csv(uploaded_file):
-    if uploaded_file is None: return None, []
-    try:
-        bytes_data = uploaded_file.getvalue()
-        sniffer_content = bytes_data.decode('utf-8', errors='replace')
-        sniffer = io.StringIO(sniffer_content)
-        sep = ';'
-        try:
-            sample_data = sniffer.read(min(1024 * 20, len(sniffer_content)))
-            if sample_data:
-                 dialect = pd.io.parsers.readers.csv.Sniffer().sniff(sample_data)
-                 if dialect.delimiter in [',', ';', '\t', '|']: sep = dialect.delimiter;
-            else: st.error("Archivo vacío."); return None, []
-        except Exception: pass
-        try:
-            df = pd.read_csv(io.BytesIO(bytes_data), encoding='utf-8', sep=sep, low_memory=False)
-        except UnicodeDecodeError:
-            df = pd.read_csv(io.BytesIO(bytes_data), encoding='latin1', sep=sep, low_memory=False)
-        except Exception as read_err: st.error(f"Error leyendo CSV con sep '{sep}': {read_err}"); return None, []
-        original_columns = df.columns.tolist()
-        df.columns = [str(col).strip() for col in original_columns]
-        detected_columns = df.columns.tolist()
-        return df, detected_columns
-    except Exception as e: st.error(f"Error leyendo muestra: {e}"); return None, []
-
+# --- extract_knowledge_std (sin cambios) ---
 @st.cache_data
 def extract_knowledge_std(df_std):
     knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
@@ -139,6 +198,7 @@ def extract_knowledge_std(df_std):
     except Exception as e_kg: st.error(f"Error extrayendo conocimiento: {e_kg}")
     return knowledge
 
+# --- train_classifier_std (sin cambios) ---
 @st.cache_resource
 def train_classifier_std(df_std):
     report = "Modelo no entrenado."
@@ -170,6 +230,7 @@ def train_classifier_std(df_std):
     except Exception as e: report = f"Error entrenamiento: {e}"; model, vectorizer = None, None
     return model, vectorizer, report
 
+# --- standardize_data_with_mapping (sin cambios) ---
 def standardize_data_with_mapping(df_raw, mapping):
     """Aplica el mapeo guardado para estandarizar un DataFrame nuevo."""
     try:
@@ -247,7 +308,7 @@ def standardize_data_with_mapping(df_raw, mapping):
         df_std = df_std[df_std[TEXTO_MODELO] != '']
         return df_std
     except Exception as e: st.error(f"Error Gral aplicando mapeo '{mapping.get('bank_name', 'Desconocido')}': {e}"); st.error(traceback.format_exc()); return None
-# ------------------------------------------------------------------------------------
+
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
@@ -255,12 +316,18 @@ st.title("🏦 Categorizador Bancario Multi-Formato v3")
 
 # --- Fase 1: Entrenamiento Inicial ---
 with st.expander("Fase 1: Entrenar Modelo con Datos Históricos Categorizados", expanded=True):
-    st.write("Sube tu archivo CSV histórico (ej: `Gastos.csv`) que ya contiene las categorías y subcategorías asignadas. Este archivo entrena el modelo base.")
-    uploaded_historic_file = st.file_uploader("Cargar Archivo Histórico Categorizado (.csv)", type="csv", key="historic_uploader_f1")
+    st.write("Sube tu archivo histórico (CSV o Excel) que ya contiene las categorías asignadas.")
+    # **** MODIFICACIÓN: Añadir tipos Excel ****
+    uploaded_historic_file = st.file_uploader(
+        "Cargar Archivo Histórico Categorizado (.csv, .xlsx, .xls)",
+        type=["csv", "xlsx", "xls"], # Aceptar ambos tipos
+        key="historic_uploader_f1"
+    )
     if uploaded_historic_file:
         if st.button("🧠 Entrenar Modelo y Aprender Conocimiento Inicial", key="train_historic_f1"):
             with st.spinner("Procesando archivo histórico y entrenando..."):
-                df_raw_hist, _ = read_sample_csv(uploaded_historic_file)
+                # Usar la nueva función genérica para leer
+                df_raw_hist, _ = read_uploaded_file(uploaded_historic_file)
                 if df_raw_hist is not None:
                     df_std_hist = parse_historic_categorized(df_raw_hist.copy())
                     if df_std_hist is not None and not df_std_hist.empty:
@@ -290,36 +357,24 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
     st.subheader("Cargar Configuración Guardada")
     uploaded_config_file = st.file_uploader(f"Cargar Archivo '{CONFIG_FILENAME}'", type="json", key="config_loader")
     if uploaded_config_file:
-        # Procesar solo si el ID del archivo es nuevo en esta sesión
-        config_uploader_key = "config_loader_processed_id" # Key para session state
+        config_uploader_key = "config_loader_processed_id"
         if uploaded_config_file.file_id != st.session_state.get(config_uploader_key, None):
             try:
                 config_data = json.load(uploaded_config_file)
                 if isinstance(config_data, dict):
-                    # Validación básica del contenido cargado (opcional pero recomendado)
                     valid_config = True
                     for bank, mapping in config_data.items():
-                        if not isinstance(mapping, dict) or 'columns' not in mapping:
-                            st.error(f"Formato inválido para el banco '{bank}' en la configuración cargada.")
-                            valid_config = False; break
+                        if not isinstance(mapping, dict) or 'columns' not in mapping: valid_config = False; break
                     if valid_config:
                         st.session_state.bank_mappings = config_data
                         st.success(f"Configuración cargada desde '{uploaded_config_file.name}'!")
                         st.sidebar.success("Config. Cargada")
-                        # Guardar ID para evitar reprocesar
                         st.session_state[config_uploader_key] = uploaded_config_file.file_id
-                        # ¡NO st.rerun() aquí!
-                    else:
-                         st.session_state[config_uploader_key] = None # Resetear para permitir reintento
-                else:
-                    st.error("Archivo de configuración no es un diccionario JSON.")
-                    st.session_state[config_uploader_key] = None
-            except json.JSONDecodeError:
-                st.error("Error leyendo JSON. Archivo inválido.")
-                st.session_state[config_uploader_key] = None
-            except Exception as e_load:
-                st.error(f"Error cargando configuración: {e_load}")
-                st.session_state[config_uploader_key] = None
+                        # No rerun aquí
+                    else: st.error("Formato inválido en config."); st.session_state[config_uploader_key] = None
+                else: st.error("Archivo config no es diccionario JSON."); st.session_state[config_uploader_key] = None
+            except json.JSONDecodeError: st.error("Error leyendo JSON."); st.session_state[config_uploader_key] = None
+            except Exception as e_load: st.error(f"Error cargando config: {e_load}"); st.session_state[config_uploader_key] = None
 
     st.divider()
 
@@ -327,10 +382,17 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
     st.subheader("Aprender/Editar Formato de Banco")
     bank_options = ["SANTANDER", "EVO", "WIZINK", "AMEX"]
     selected_bank_learn = st.selectbox("Selecciona Banco:", bank_options, key="bank_learn_f2")
-    uploaded_sample_file = st.file_uploader(f"Cargar archivo CSV de ejemplo de {selected_bank_learn}", type="csv", key="sample_uploader_f2")
+
+    # **** MODIFICACIÓN: Añadir tipos Excel ****
+    uploaded_sample_file = st.file_uploader(
+        f"Cargar archivo de ejemplo de {selected_bank_learn} (.csv, .xlsx, .xls)",
+        type=["csv", "xlsx", "xls"], # Aceptar ambos tipos
+        key="sample_uploader_f2"
+    )
 
     if uploaded_sample_file:
-        df_sample, detected_columns = read_sample_csv(uploaded_sample_file)
+        # Usar la nueva función genérica para leer
+        df_sample, detected_columns = read_uploaded_file(uploaded_sample_file)
         if df_sample is not None:
             st.write(f"Columnas detectadas en {selected_bank_learn}:"); st.code(f"{detected_columns}")
             st.dataframe(df_sample.head(3))
@@ -362,7 +424,6 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
             map_thousands_sep = st.text_input("Separador Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
 
             if st.button(f"💾 Guardar Mapeo para {selected_bank_learn}", key="save_mapping_f2"):
-                # Construir y Validar el mapeo AHORA
                 final_mapping_cols = {}
                 if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto
                 if map_importe: final_mapping_cols[IMPORTE_STD] = map_importe
@@ -390,7 +451,7 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
                     if map_single_date and map_formato_fecha: mapping_to_save['date_format'] = map_formato_fecha.strip()
                     st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
                     st.success(f"¡Mapeo para {selected_bank_learn} guardado/actualizado!")
-                    # No es necesario rerun aquí, el estado se actualiza para la próxima interacción
+                    # No es necesario rerun aquí tampoco
                 else: st.warning("Revisa errores antes de guardar.")
 
     # **Descargar Configuración**
@@ -417,12 +478,16 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
     elif not mappings_available:
         st.warning("⚠️ No se han aprendido o cargado formatos bancarios (Ver Fase 2).")
     else: # Modelo y Mapeos listos
-        st.write("Selecciona el banco y sube el archivo CSV **sin categorizar** que deseas procesar.")
+        st.write("Selecciona el banco y sube el archivo **sin categorizar** (CSV o Excel) que deseas procesar.")
         available_banks_for_pred = list(st.session_state.bank_mappings.keys())
-
         selected_bank_predict = st.selectbox("Banco del Nuevo Archivo:", available_banks_for_pred, key="bank_predict_f3")
 
-        uploaded_final_file = st.file_uploader(f"Cargar archivo CSV NUEVO de {selected_bank_predict}", type="csv", key="final_uploader_f3")
+        # **** MODIFICACIÓN: Añadir tipos Excel ****
+        uploaded_final_file = st.file_uploader(
+            f"Cargar archivo NUEVO de {selected_bank_predict} (.csv, .xlsx, .xls)",
+            type=["csv", "xlsx", "xls"], # Aceptar ambos tipos
+            key="final_uploader_f3"
+        )
 
         if uploaded_final_file and selected_bank_predict:
             mapping_to_use = st.session_state.bank_mappings.get(selected_bank_predict)
@@ -432,7 +497,8 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
                  st.write(f"Procesando '{uploaded_final_file.name}'...")
                  df_std_new = None
                  with st.spinner(f"Estandarizando datos..."):
-                      df_raw_new, _ = read_sample_csv(uploaded_final_file)
+                      # Usar la nueva función genérica para leer
+                      df_raw_new, _ = read_uploaded_file(uploaded_final_file)
                       if df_raw_new is not None:
                           df_std_new = standardize_data_with_mapping(df_raw_new.copy(), mapping_to_use)
                       else: st.error(f"No se pudo leer: {uploaded_final_file.name}")
@@ -449,10 +515,9 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
                                          X_new_vec = st.session_state.vectorizer.transform(df_pred[TEXTO_MODELO])
                                          predictions = st.session_state.model.predict(X_new_vec) # numpy.ndarray
 
-                                         # *** CORRECCIÓN APLICADA ***
+                                         # Convertir cada elemento del array a string y capitalizar
                                          capitalized_predictions = [str(p).capitalize() for p in predictions]
                                          df_pred[CATEGORIA_PREDICHA] = capitalized_predictions
-                                         # *** FIN CORRECCIÓN ***
 
                                          st.subheader("📊 Resultados")
                                          display_cols = [CATEGORIA_PREDICHA, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
@@ -481,9 +546,9 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
 st.sidebar.divider()
 st.sidebar.header("Acerca de")
 st.sidebar.info(
-    "1. Entrena con tu CSV histórico. "
-    "2. Enseña/Carga los formatos de tus bancos. Guarda la configuración. "
-    "3. Sube nuevos archivos para categorizarlos."
+    "1. Entrena con tu CSV/Excel histórico. "
+    "2. Enseña/Carga los formatos (CSV/Excel). Guarda config. "
+    "3. Sube nuevos archivos (CSV/Excel) para categorizar."
 )
 # Mostrar estado actual en Sidebar
 st.sidebar.divider()
