@@ -37,100 +37,68 @@ if 'knowledge' not in st.session_state: st.session_state.knowledge = {'categoria
 if 'bank_mappings' not in st.session_state: st.session_state.bank_mappings = {}
 if 'training_report' not in st.session_state: st.session_state.training_report = "Modelo no entrenado."
 
-# --- Funciones ---
+# --- Funciones (Parseo, ML, Estandarización) ---
+# (Se asume que las funciones parse_historic_categorized, read_sample_csv,
+# extract_knowledge_std, train_classifier_std, y standardize_data_with_mapping
+# de la respuesta *anterior* (la que corregía el error 'str') están aquí)
 
+# ----- COPIA AQUÍ LAS FUNCIONES COMPLETAS Y CORREGIDAS DE LA RESPUESTA ANTERIOR -----
 def parse_historic_categorized(df_raw):
     """Parsea el Gastos.csv inicial para entrenamiento."""
     try:
         #st.write("Debug (parse_historic): Iniciando parseo...")
-        if not isinstance(df_raw, pd.DataFrame):
-            st.error("Error Interno: parse_historic_categorized no recibió un DataFrame.")
-            return None
+        if not isinstance(df_raw, pd.DataFrame): st.error("Error Interno: parse_historic_categorized no recibió un DataFrame."); return None
         df = df_raw.copy()
         try:
             df.columns = [str(col).upper().strip() for col in df.columns]
-            #st.write(f"Debug (parse_historic): Columnas limpiadas: {df.columns.tolist()}")
-        except Exception as e_col:
-            st.error(f"Error limpiando nombres de columna: {e_col}")
-            return None
-
+        except Exception as e_col: st.error(f"Error limpiando nombres de columna: {e_col}"); return None
         required = ['CONCEPTO', 'CATEGORÍA', 'SUBCATEGORIA', 'IMPORTE', 'AÑO', 'MES', 'DIA']
-        if 'COMERCIO' not in df.columns:
-            #st.warning("Archivo histórico: Columna 'COMERCIO' no encontrada. Se creará vacía.")
-            df['COMERCIO'] = ''
+        if 'COMERCIO' not in df.columns: df['COMERCIO'] = ''
         missing = [col for col in required if col not in df.columns]
-        if missing:
-            st.error(f"Archivo histórico: Faltan columnas esenciales: {', '.join(missing)}")
-            return None
-
+        if missing: st.error(f"Archivo histórico: Faltan columnas esenciales: {', '.join(missing)}"); return None
         df_std = pd.DataFrame()
         text_cols_mapping = { CONCEPTO_STD: 'CONCEPTO', COMERCIO_STD: 'COMERCIO', CATEGORIA_STD: 'CATEGORÍA', SUBCATEGORIA_STD: 'SUBCATEGORIA' }
-
         for std_col, raw_col in text_cols_mapping.items():
-            #st.write(f"Debug (parse_historic): Procesando '{raw_col}' -> '{std_col}'")
             if raw_col not in df.columns:
                  if std_col == COMERCIO_STD: df_std[COMERCIO_STD] = ''; continue
                  st.error(f"Error Interno: Columna '{raw_col}' desapareció."); return None
             try:
                 series = df[raw_col].fillna('').astype(str)
-                if pd.api.types.is_string_dtype(series.dtype):
-                     df_std[std_col] = series.str.lower().str.strip()
-                else:
-                     df_std[std_col] = series.apply(lambda x: str(x).lower().strip())
-                #st.write(f"Debug (parse_historic): Columna '{std_col}' procesada OK.")
+                if pd.api.types.is_string_dtype(series.dtype): df_std[std_col] = series.str.lower().str.strip()
+                else: df_std[std_col] = series.apply(lambda x: str(x).lower().strip())
             except AttributeError as ae:
                 st.error(f"!!! Error de Atributo procesando '{raw_col}' -> '{std_col}'.")
                 try:
                     problematic_types = df[raw_col].apply(type).value_counts()
-                    st.error(f"Tipos de datos encontrados en '{raw_col}':\n{problematic_types}")
+                    st.error(f"Tipos encontrados: {problematic_types}")
                     non_string_indices = df[raw_col].apply(lambda x: not isinstance(x, (str, type(None), float, int))).index
-                    if not non_string_indices.empty:
-                         st.error(f"Primeros valores no textuales en '{raw_col}':\n{df.loc[non_string_indices, raw_col].head()}")
+                    if not non_string_indices.empty: st.error(f"Valores no textuales: {df.loc[non_string_indices, raw_col].head()}")
                 except Exception as e_diag: st.error(f"No se pudo diagnosticar: {e_diag}")
                 return None
-            except Exception as e:
-                st.error(f"Error inesperado procesando texto en '{raw_col}': {e}"); st.error(traceback.format_exc()); return None
-
-        #st.write("Debug (parse_historic): Procesando IMPORTE")
+            except Exception as e: st.error(f"Error proc. texto '{raw_col}': {e}"); st.error(traceback.format_exc()); return None
         try:
             importe_str = df['IMPORTE'].astype(str).str.replace(',', '.', regex=False)
             df_std[IMPORTE_STD] = pd.to_numeric(importe_str, errors='coerce')
             if df_std[IMPORTE_STD].isnull().any(): st.warning("Histórico: Algunos importes no son números.")
-        except Exception as e: st.error(f"Error procesando IMPORTE histórico: {e}"); return None
-
-        #st.write("Debug (parse_historic): Procesando Fechas")
+        except Exception as e: st.error(f"Error proc. IMPORTE histórico: {e}"); return None
         try:
-            for col in ['AÑO', 'MES', 'DIA']:
-                df_std[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-        except Exception as e: st.error(f"Error procesando Fechas históricas: {e}"); return None
-
-        #st.write("Debug (parse_historic): Creando TEXTO_MODELO")
+            for col in ['AÑO', 'MES', 'DIA']: df_std[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+        except Exception as e: st.error(f"Error proc. Fechas históricas: {e}"); return None
         try:
             if CONCEPTO_STD not in df_std: df_std[CONCEPTO_STD] = ''
             if COMERCIO_STD not in df_std: df_std[COMERCIO_STD] = ''
             df_std[TEXTO_MODELO] = df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]
             df_std[TEXTO_MODELO] = df_std[TEXTO_MODELO].str.strip()
         except Exception as e: st.error(f"Error creando TEXTO_MODELO: {e}"); return None
-
-        #st.write("Debug (parse_historic): Filtrando filas finales...")
-        initial_rows = len(df_std)
-        if CATEGORIA_STD not in df_std.columns: st.error("Falta CATEGORIA_STD antes del filtrado."); return None
+        if CATEGORIA_STD not in df_std.columns: st.error("Falta CATEGORIA_STD."); return None
         df_std = df_std.dropna(subset=[IMPORTE_STD, CATEGORIA_STD])
         df_std = df_std[df_std[CATEGORIA_STD] != '']
-        rows_after_filter = len(df_std)
-        #st.write(f"Debug (parse_historic): Filas antes: {initial_rows}, después: {rows_after_filter}")
         if df_std.empty: st.warning("No quedaron filas válidas tras filtrar."); return pd.DataFrame()
-
-        #st.write("Debug (parse_historic): Finalizado OK.")
         return df_std
+    except Exception as e: st.error(f"Error Gral parseando histórico: {e}"); st.error(traceback.format_exc()); return None
 
-    except Exception as e:
-        st.error(f"Error general crítico parseando histórico: {e}")
-        st.error(traceback.format_exc()); return None
-
-@st.cache_data # Cachear la lectura puede ser útil
+@st.cache_data
 def read_sample_csv(uploaded_file):
-    """Lee un CSV de muestra y devuelve el DataFrame y sus columnas."""
     if uploaded_file is None: return None, []
     try:
         bytes_data = uploaded_file.getvalue()
@@ -141,17 +109,14 @@ def read_sample_csv(uploaded_file):
             sample_data = sniffer.read(min(1024 * 20, len(sniffer_content)))
             if sample_data:
                  dialect = pd.io.parsers.readers.csv.Sniffer().sniff(sample_data)
-                 if dialect.delimiter in [',', ';', '\t', '|']: sep = dialect.delimiter; #st.info(f"Separador detectado: '{sep}'")
-                 #else: st.warning(f"Separador detectado ('{dialect.delimiter}') inusual, usando ';'.")
+                 if dialect.delimiter in [',', ';', '\t', '|']: sep = dialect.delimiter;
             else: st.error("Archivo vacío."); return None, []
-        except Exception: pass #st.warning(f"No se detectó separador, asumiendo ';'.")
-
+        except Exception: pass
         try:
             df = pd.read_csv(io.BytesIO(bytes_data), encoding='utf-8', sep=sep, low_memory=False)
         except UnicodeDecodeError:
             df = pd.read_csv(io.BytesIO(bytes_data), encoding='latin1', sep=sep, low_memory=False)
-        except Exception as read_err: st.error(f"Error leyendo CSV con separador '{sep}': {read_err}"); return None, []
-
+        except Exception as read_err: st.error(f"Error leyendo CSV con sep '{sep}': {read_err}"); return None, []
         original_columns = df.columns.tolist()
         df.columns = [str(col).strip() for col in original_columns]
         detected_columns = df.columns.tolist()
@@ -216,12 +181,10 @@ def standardize_data_with_mapping(df_raw, mapping):
         df = df_raw.copy()
         df.columns = [str(col).strip() for col in df.columns]
         original_columns = df.columns.tolist()
-
         temp_std_data = {}
         source_cols_used = []
         found_essential = {std_col: False for std_col in MANDATORY_STD_COLS if std_col != FECHA_STD}
         found_optional = {std_col: False for std_col in OPTIONAL_STD_COLS}
-
         for std_col, source_col in mapping['columns'].items():
              if source_col in original_columns:
                   temp_std_data[std_col] = df[source_col]
@@ -233,18 +196,14 @@ def standardize_data_with_mapping(df_raw, mapping):
                                 (std_col==FECHA_STD and not (AÑO_STD in mapping['columns'] and MES_STD in mapping['columns'] and DIA_STD in mapping['columns'])) or \
                                 (std_col in [AÑO_STD, MES_STD, DIA_STD] and not FECHA_STD in mapping['columns'])
                   if is_essential: st.error(f"Columna esencial mapeada '{source_col}' ('{std_col}') no encontrada."); return None
-                  #else: st.info(f"Columna opcional mapeada '{source_col}' ('{std_col}') no encontrada.")
-
         df_std = pd.DataFrame(temp_std_data)
         missing_essential_mapped = [k for k, v in found_essential.items() if not v]
         if missing_essential_mapped: st.error(f"Faltan mapeos esenciales: {missing_essential_mapped}"); return None
-
         fecha_col_std = mapping['columns'].get(FECHA_STD)
         año_col_std = mapping['columns'].get(AÑO_STD)
         mes_col_std = mapping['columns'].get(MES_STD)
         dia_col_std = mapping['columns'].get(DIA_STD)
         date_processed_ok = False
-
         if FECHA_STD in df_std.columns:
             date_format = mapping.get('date_format')
             if not date_format: st.error("Falta formato fecha."); return None
@@ -259,54 +218,40 @@ def standardize_data_with_mapping(df_raw, mapping):
                 df_std = df_std.drop(columns=[FECHA_STD])
                 date_processed_ok = True
             except Exception as e_date: st.error(f"Error procesando fecha única: {e_date}"); return None
-
         elif all(col in df_std.columns for col in [AÑO_STD, MES_STD, DIA_STD]):
             try:
-                for col_std in [AÑO_STD, MES_STD, DIA_STD]:
-                    df_std[col_std] = pd.to_numeric(df_std[col_std], errors='coerce').fillna(0).astype(int)
+                for col_std in [AÑO_STD, MES_STD, DIA_STD]: df_std[col_std] = pd.to_numeric(df_std[col_std], errors='coerce').fillna(0).astype(int)
                 date_processed_ok = True
             except Exception as e_num: st.error(f"Error convirtiendo A/M/D a número: {e_num}"); return None
         else: st.error("Mapeo de fecha incompleto."); return None
-
         if not date_processed_ok: return None
-
         if IMPORTE_STD in df_std.columns:
             try:
                 importe_str = df_std[IMPORTE_STD].fillna('0').astype(str)
-                thousands_sep = mapping.get('thousands_sep')
+                thousands_sep = mapping.get('thousands_sep'); decimal_sep = mapping.get('decimal_sep', ',')
                 if thousands_sep: importe_str = importe_str.str.replace(thousands_sep, '', regex=False)
-                decimal_sep = mapping.get('decimal_sep', ',')
                 importe_str = importe_str.str.replace(decimal_sep, '.', regex=False)
                 df_std[IMPORTE_STD] = pd.to_numeric(importe_str, errors='coerce')
                 if df_std[IMPORTE_STD].isnull().any(): st.warning("Algunos importes no pudieron convertirse.")
             except Exception as e_imp: st.error(f"Error procesando importe: {e_imp}"); return None
         else: st.error("Falta columna IMPORTE_STD mapeada."); return None
-
         for col_std in [CONCEPTO_STD, COMERCIO_STD]:
-            if col_std in df_std.columns:
-                df_std[col_std] = df_std[col_std].fillna('').astype(str).str.lower().str.strip()
+            if col_std in df_std.columns: df_std[col_std] = df_std[col_std].fillna('').astype(str).str.lower().str.strip()
             elif col_std == COMERCIO_STD: df_std[COMERCIO_STD] = ''
-
         if CONCEPTO_STD not in df_std: df_std[CONCEPTO_STD] = ''
         if COMERCIO_STD not in df_std: df_std[COMERCIO_STD] = ''
         df_std[TEXTO_MODELO] = df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]
         df_std[TEXTO_MODELO] = df_std[TEXTO_MODELO].str.strip()
-
         original_cols_to_keep = [c for c in original_columns if c not in source_cols_used]
         for col in original_cols_to_keep:
-            target_col_name = f"ORIG_{col}"
-            suffix = 1
+            target_col_name = f"ORIG_{col}"; suffix = 1
             while target_col_name in df_std.columns: target_col_name = f"ORIG_{col}_{suffix}"; suffix += 1
             df_std[target_col_name] = df[col]
-
         df_std = df_std.dropna(subset=[IMPORTE_STD, TEXTO_MODELO])
         df_std = df_std[df_std[TEXTO_MODELO] != '']
         return df_std
-
-    except Exception as e:
-        st.error(f"Error inesperado aplicando mapeo '{mapping.get('bank_name', 'Desconocido')}': {e}")
-        st.error(traceback.format_exc()); return None
-
+    except Exception as e: st.error(f"Error Gral aplicando mapeo '{mapping.get('bank_name', 'Desconocido')}': {e}"); st.error(traceback.format_exc()); return None
+# ------------------------------------------------------------------------------------
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
@@ -341,7 +286,7 @@ with st.expander("Fase 1: Entrenar Modelo con Datos Históricos Categorizados", 
                     else: st.error("No se pudo parsear el histórico o no contenía datos válidos."); st.session_state.model_trained = False
                 else: st.error("No se pudo leer el archivo histórico."); st.session_state.model_trained = False
 
-# --- Fase 2: Aprendizaje de Formatos Bancarios ---
+# --- Fase 2: Aprendizaje de Formatos Bancarios y Configuración ---
 with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
     st.write("Aquí puedes enseñar a la aplicación cómo leer archivos de diferentes bancos o cargar una configuración guardada.")
 
@@ -355,15 +300,19 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
                 st.session_state.bank_mappings = config_data
                 st.success(f"Configuración cargada desde '{uploaded_config_file.name}'!")
                 st.sidebar.success("Config. Cargada")
-            else: st.error("Archivo de configuración no es un diccionario JSON válido.")
-        except json.JSONDecodeError: st.error("Error leyendo JSON. Archivo inválido.")
-        except Exception as e_load: st.error(f"Error cargando configuración: {e_load}")
+                st.rerun() # Recargar para que la UI refleje los mapeos cargados
+            else:
+                st.error("El archivo de configuración no tiene el formato esperado (debe ser un diccionario JSON).")
+        except json.JSONDecodeError:
+            st.error("Error al leer el archivo JSON. Asegúrate de que el archivo es válido.")
+        except Exception as e_load:
+            st.error(f"Error inesperado al cargar la configuración: {e_load}")
 
     st.divider()
 
     # **Aprender Nuevo Formato**
     st.subheader("Aprender/Editar Formato de Banco")
-    bank_options = ["SANTANDER", "EVO", "WIZINK", "AMEX"]
+    bank_options = ["SANTANDER", "EVO", "WIZINK", "AMEX"] # Añade más bancos aquí
     selected_bank_learn = st.selectbox("Selecciona Banco:", bank_options, key="bank_learn_f2")
 
     uploaded_sample_file = st.file_uploader(f"Cargar archivo CSV de ejemplo de {selected_bank_learn}", type="csv", key="sample_uploader_f2")
@@ -375,51 +324,75 @@ with st.expander("Fase 2: Aprender Formatos y Cargar/Guardar Configuración"):
             st.dataframe(df_sample.head(3))
             st.subheader("Mapeo de Columnas")
             saved_mapping = st.session_state.bank_mappings.get(selected_bank_learn, {'columns': {}})
-            current_mapping_ui = {'columns': {}}
+            # Usaremos directamente los widgets para obtener los valores al presionar el botón
+            # No necesitamos construir current_mapping_ui aquí
+
             cols_with_none = [None] + detected_columns
 
             st.markdown("**Campos Esenciales:**")
-            current_mapping_ui['columns'][CONCEPTO_STD] = st.selectbox(f"`{CONCEPTO_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(CONCEPTO_STD)) if saved_mapping['columns'].get(CONCEPTO_STD) in cols_with_none else 0, key=f"map_{CONCEPTO_STD}_{selected_bank_learn}")
-            current_mapping_ui['columns'][IMPORTE_STD] = st.selectbox(f"`{IMPORTE_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(IMPORTE_STD)) if saved_mapping['columns'].get(IMPORTE_STD) in cols_with_none else 0, key=f"map_{IMPORTE_STD}_{selected_bank_learn}")
+            map_concepto = st.selectbox(f"`{CONCEPTO_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(CONCEPTO_STD)) if saved_mapping['columns'].get(CONCEPTO_STD) in cols_with_none else 0, key=f"map_{CONCEPTO_STD}_{selected_bank_learn}")
+            map_importe = st.selectbox(f"`{IMPORTE_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(IMPORTE_STD)) if saved_mapping['columns'].get(IMPORTE_STD) in cols_with_none else 0, key=f"map_{IMPORTE_STD}_{selected_bank_learn}")
 
             st.markdown("**Campo de Fecha:**")
             is_single_date_saved = FECHA_STD in saved_mapping['columns']
             map_single_date = st.checkbox("Fecha en una sola columna", value=is_single_date_saved, key=f"map_single_date_{selected_bank_learn}")
+            map_fecha_unica = None
+            map_formato_fecha = None
+            map_año = None
+            map_mes = None
+            map_dia = None
             if map_single_date:
-                current_mapping_ui['columns'][FECHA_STD] = st.selectbox(f"`{FECHA_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(FECHA_STD)) if saved_mapping['columns'].get(FECHA_STD) in cols_with_none else 0, key=f"map_{FECHA_STD}_{selected_bank_learn}")
-                date_format_guess = st.text_input("Formato fecha (ej: %d/%m/%Y)", value=saved_mapping.get('date_format', ''), help="Códigos `strftime` Python", key=f"map_date_format_{selected_bank_learn}")
-                if date_format_guess: current_mapping_ui['date_format'] = date_format_guess.strip()
-                current_mapping_ui['columns'].pop(AÑO_STD, None); current_mapping_ui['columns'].pop(MES_STD, None); current_mapping_ui['columns'].pop(DIA_STD, None)
+                map_fecha_unica = st.selectbox(f"`{FECHA_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(FECHA_STD)) if saved_mapping['columns'].get(FECHA_STD) in cols_with_none else 0, key=f"map_{FECHA_STD}_{selected_bank_learn}")
+                map_formato_fecha = st.text_input("Formato fecha (ej: %d/%m/%Y)", value=saved_mapping.get('date_format', ''), help="Códigos `strftime` Python", key=f"map_date_format_{selected_bank_learn}")
             else:
-                current_mapping_ui['columns'][AÑO_STD] = st.selectbox(f"`{AÑO_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(AÑO_STD)) if saved_mapping['columns'].get(AÑO_STD) in cols_with_none else 0, key=f"map_{AÑO_STD}_{selected_bank_learn}")
-                current_mapping_ui['columns'][MES_STD] = st.selectbox(f"`{MES_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(MES_STD)) if saved_mapping['columns'].get(MES_STD) in cols_with_none else 0, key=f"map_{MES_STD}_{selected_bank_learn}")
-                current_mapping_ui['columns'][DIA_STD] = st.selectbox(f"`{DIA_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(DIA_STD)) if saved_mapping['columns'].get(DIA_STD) in cols_with_none else 0, key=f"map_{DIA_STD}_{selected_bank_learn}")
-                current_mapping_ui['columns'].pop(FECHA_STD, None); current_mapping_ui.pop('date_format', None)
+                map_año = st.selectbox(f"`{AÑO_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(AÑO_STD)) if saved_mapping['columns'].get(AÑO_STD) in cols_with_none else 0, key=f"map_{AÑO_STD}_{selected_bank_learn}")
+                map_mes = st.selectbox(f"`{MES_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(MES_STD)) if saved_mapping['columns'].get(MES_STD) in cols_with_none else 0, key=f"map_{MES_STD}_{selected_bank_learn}")
+                map_dia = st.selectbox(f"`{DIA_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(DIA_STD)) if saved_mapping['columns'].get(DIA_STD) in cols_with_none else 0, key=f"map_{DIA_STD}_{selected_bank_learn}")
 
             st.markdown("**Campos Opcionales:**")
-            current_mapping_ui['columns'][COMERCIO_STD] = st.selectbox(f"`{COMERCIO_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(COMERCIO_STD)) if saved_mapping['columns'].get(COMERCIO_STD) in cols_with_none else 0, key=f"map_{COMERCIO_STD}_{selected_bank_learn}")
+            map_comercio = st.selectbox(f"`{COMERCIO_STD}`", cols_with_none, index=cols_with_none.index(saved_mapping['columns'].get(COMERCIO_STD)) if saved_mapping['columns'].get(COMERCIO_STD) in cols_with_none else 0, key=f"map_{COMERCIO_STD}_{selected_bank_learn}")
 
             st.markdown("**Configuración Importe:**")
-            current_mapping_ui['decimal_sep'] = st.text_input("Separador Decimal", value=saved_mapping.get('decimal_sep', ','), key=f"map_decimal_{selected_bank_learn}")
-            current_mapping_ui['thousands_sep'] = st.text_input("Separador Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
+            map_decimal_sep = st.text_input("Separador Decimal", value=saved_mapping.get('decimal_sep', ','), key=f"map_decimal_{selected_bank_learn}")
+            map_thousands_sep = st.text_input("Separador Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
 
-            final_mapping_cols = {std: src for std, src in current_mapping_ui['columns'].items() if src is not None}
-            valid_mapping = True
-            if not final_mapping_cols.get(CONCEPTO_STD): st.error("Mapea CONCEPTO_STD."); valid_mapping = False
-            if not final_mapping_cols.get(IMPORTE_STD): st.error("Mapea IMPORTE_STD."); valid_mapping = False
-            if map_single_date:
-                 if not final_mapping_cols.get(FECHA_STD): st.error("Mapea FECHA_STD."); valid_mapping = False
-                 elif not current_mapping_ui.get('date_format'): st.error("Especifica formato fecha."); valid_mapping = False
-            else:
-                 if not all(final_mapping_cols.get(d) for d in [AÑO_STD, MES_STD, DIA_STD]): st.error("Mapea AÑO, MES y DIA."); valid_mapping = False
+            # --- Botón de Guardado y Lógica ---
+            if st.button(f"💾 Guardar Mapeo para {selected_bank_learn}", key="save_mapping_f2"):
+                # Construir el mapeo AHORA, usando los valores actuales de los widgets
+                final_mapping_cols = {}
+                if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto
+                if map_importe: final_mapping_cols[IMPORTE_STD] = map_importe
+                if map_single_date and map_fecha_unica: final_mapping_cols[FECHA_STD] = map_fecha_unica
+                if not map_single_date and map_año: final_mapping_cols[AÑO_STD] = map_año
+                if not map_single_date and map_mes: final_mapping_cols[MES_STD] = map_mes
+                if not map_single_date and map_dia: final_mapping_cols[DIA_STD] = map_dia
+                if map_comercio: final_mapping_cols[COMERCIO_STD] = map_comercio # Opcional
 
-            if valid_mapping:
-                 mapping_to_save = {'bank_name': selected_bank_learn, 'columns': final_mapping_cols, 'decimal_sep': current_mapping_ui.get('decimal_sep', ',').strip(), 'thousands_sep': current_mapping_ui.get('thousands_sep', '').strip() or None}
-                 if map_single_date and current_mapping_ui.get('date_format'): mapping_to_save['date_format'] = current_mapping_ui['date_format']
-                 if st.button(f"💾 Guardar Mapeo para {selected_bank_learn}", key="save_mapping_f2"):
-                      st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
-                      st.success(f"Mapeo {selected_bank_learn} guardado/actualizado!"); st.rerun() # Recargar para reflejar en sidebar
-            else: st.warning("Revisa errores antes de guardar.")
+                # Validación
+                valid_mapping = True
+                if not final_mapping_cols.get(CONCEPTO_STD): st.error("Mapea CONCEPTO_STD."); valid_mapping = False
+                if not final_mapping_cols.get(IMPORTE_STD): st.error("Mapea IMPORTE_STD."); valid_mapping = False
+                if map_single_date:
+                    if not final_mapping_cols.get(FECHA_STD): st.error("Mapea FECHA_STD."); valid_mapping = False
+                    elif not map_formato_fecha: st.error("Especifica formato fecha."); valid_mapping = False
+                else:
+                    if not all(final_mapping_cols.get(d) for d in [AÑO_STD, MES_STD, DIA_STD]): st.error("Mapea AÑO, MES y DIA."); valid_mapping = False
+
+                if valid_mapping:
+                    mapping_to_save = {
+                        'bank_name': selected_bank_learn,
+                        'columns': final_mapping_cols,
+                        'decimal_sep': map_decimal_sep.strip(),
+                        'thousands_sep': map_thousands_sep.strip() or None,
+                    }
+                    if map_single_date and map_formato_fecha:
+                        mapping_to_save['date_format'] = map_formato_fecha.strip()
+
+                    st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
+                    st.success(f"¡Mapeo para {selected_bank_learn} guardado/actualizado!")
+                    st.rerun() # Recargar para reflejar cambio en sidebar
+                else:
+                    st.warning("Revisa los errores antes de guardar.")
 
     # **Descargar Configuración**
     st.divider()
@@ -476,7 +449,7 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
                                              X_new_vec = st.session_state.vectorizer.transform(df_pred[TEXTO_MODELO])
                                              predictions = st.session_state.model.predict(X_new_vec)
 
-                                             # *** CORRECCIÓN AQUÍ ***
+                                             # *** CORRECCIÓN APLICADA ***
                                              capitalized_predictions = [str(p).capitalize() for p in predictions]
                                              df_pred[CATEGORIA_PREDICHA] = capitalized_predictions
                                              # *** FIN CORRECCIÓN ***
@@ -497,13 +470,9 @@ with st.expander("Fase 3: Categorizar Nuevos Archivos", expanded=True):
                                              )
                                         else: st.warning("No quedaron filas válidas para categorizar.")
                               except AttributeError as ae_inner:
-                                   # Capturar específicamente el error de atributo si ocurre aquí
-                                   st.error(f"Error de Atributo (interno): {ae_inner}")
-                                   st.error("Esto puede indicar un problema con los datos de predicción o el modelo.")
-                                   st.error(traceback.format_exc())
+                                   st.error(f"Error de Atributo (interno): {ae_inner}"); st.error(traceback.format_exc())
                               except Exception as e_pred:
-                                   st.error(f"Error durante la predicción: {e_pred}")
-                                   st.error(traceback.format_exc())
+                                   st.error(f"Error durante la predicción: {e_pred}"); st.error(traceback.format_exc())
 
                      elif df_std_new is not None and df_std_new.empty:
                          st.warning("Archivo vacío o sin datos válidos tras estandarizar.")
