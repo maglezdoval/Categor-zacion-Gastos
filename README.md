@@ -1,1 +1,1 @@
-# Categor-zacion-Gastos
+# Categorizacion-Gastos
