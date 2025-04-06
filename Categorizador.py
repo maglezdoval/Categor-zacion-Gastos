@@ -1,13 +1,13 @@
 
-**Cambios Clave:**
+# **Cambios Clave:**
 
-1.  **Búsqueda Flexible de Categoría:** Tanto en `parse_accumulated_db_for_training` como en la lógica de carga del sidebar, se itera sobre una lista `possible_cat_cols` para encontrar la columna de categoría existente.
-2.  **Renombrado a `CATEGORIA_STD`:** Una vez encontrada la columna de categoría (`cat_col_found`), si no se llama ya `CATEGORIA_STD`, se renombra a `CATEGORIA_STD`. Esto asegura que el resto del código que espera `CATEGORIA_STD` (como `extract_knowledge_std` y `train_classifier_std`) funcione correctamente.
-3.  **Validación Posterior:** La validación de columnas requeridas se hace *después* de intentar encontrar y renombrar la columna de categoría.
+# 1.  **Búsqueda Flexible de Categoría:** Tanto en `parse_accumulated_db_for_training` como en la lógica de carga del sidebar, se itera sobre una lista `possible_cat_cols` para encontrar la columna de categoría existente.
+# 2.  **Renombrado a `CATEGORIA_STD`:** Una vez encontrada la columna de categoría (`cat_col_found`), si no se llama ya `CATEGORIA_STD`, se renombra a `CATEGORIA_STD`. Esto asegura que el resto del código que espera `CATEGORIA_STD` (como `extract_knowledge_std` y `train_classifier_std`) funcione correctamente.
+# 3.  **Validación Posterior:** La validación de columnas requeridas se hace *después* de intentar encontrar y renombrar la columna de categoría.
 
-**Código Completo (para referencia):**
+# **Código Completo (para referencia):**
 
-```python
+
 import streamlit as st
 import pandas as pd
 from sklearn.model_selection import train_test_split
