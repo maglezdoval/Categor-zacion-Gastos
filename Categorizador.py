@@ -45,6 +45,7 @@ if 'debug_predictions' not in st.session_state: st.session_state.debug_predictio
 # --- Funciones ---
 @st.cache_data
 def read_uploaded_file(uploaded_file):
+    # ... (sin cambios) ...
     if uploaded_file is None: return None, []
     try:
         file_name = uploaded_file.name; bytes_data = uploaded_file.getvalue(); df = None
@@ -77,82 +78,149 @@ def read_uploaded_file(uploaded_file):
     except Exception as e: st.error(f"Error Gral leyendo '{uploaded_file.name if uploaded_file else ''}': {e}"); st.error(traceback.format_exc()); return None, []
 
 def parse_historic_categorized(df_raw):
+    """Parsea el archivo histórico inicial (ej: Gastos.csv) para entrenamiento."""
     try:
         if not isinstance(df_raw, pd.DataFrame): st.error("Parse Histórico: No es DF."); return None
         df = df_raw.copy(); df.columns = [str(col).upper().strip() for col in df.columns]
         required = ['CONCEPTO', 'CATEGORÍA', 'SUBCATEGORIA', 'IMPORTE', 'AÑO', 'MES', 'DIA']
+        # Asegurar columnas opcionales para el parseo estándar
         if 'COMERCIO' not in df.columns: df['COMERCIO'] = ''
         if CUENTA_COL_ORIG not in df.columns: df[CUENTA_COL_ORIG] = ''
+
         missing = [col for col in required if col not in df.columns]
         if missing: st.error(f"Histórico: Faltan cols: {missing}"); return None
+
         df_std = pd.DataFrame()
-        text_map = { CONCEPTO_STD: 'CONCEPTO', COMERCIO_STD: 'COMERCIO', CATEGORIA_STD: 'CATEGORÍA', SUBCATEGORIA_STD: 'SUBCATEGORIA', CUENTA_COL_STD: CUENTA_COL_ORIG}
-        for std_col, raw_col in text_map.items():
-            if raw_col not in df.columns:
+        # Mapeo explícito para el formato histórico conocido
+        map_dict = {
+            CONCEPTO_STD: 'CONCEPTO', COMERCIO_STD: 'COMERCIO',
+            CATEGORIA_STD: 'CATEGORÍA', SUBCATEGORIA_STD: 'SUBCATEGORIA',
+            IMPORTE_STD: 'IMPORTE', # Se procesará luego
+            AÑO_STD: 'AÑO', MES_STD: 'MES', DIA_STD: 'DIA', # Se procesarán luego
+            CUENTA_COL_STD: CUENTA_COL_ORIG # Usar estándar para cuenta
+        }
+
+        for std_col, raw_col in map_dict.items():
+            if raw_col not in df.columns: # Chequeo redundante
+                 # Solo COMERCIO y CUENTA pueden faltar realmente aquí
                  if std_col in [COMERCIO_STD, CUENTA_COL_STD]: df_std[std_col] = ''; continue
                  st.error(f"Error Interno: Falta '{raw_col}'."); return None
             try:
-                series = df[raw_col].fillna('').astype(str)
-                df_std[std_col] = series.str.lower().str.strip() if pd.api.types.is_string_dtype(series.dtype) else series.apply(lambda x: str(x).lower().strip())
-            except AttributeError as ae: st.error(f"!!! Error Atributo '{raw_col}' -> '{std_col}'."); return None
-            except Exception as e: st.error(f"Error proc. texto '{raw_col}': {e}"); return None
+                # Procesar texto
+                if std_col in [CONCEPTO_STD, COMERCIO_STD, CATEGORIA_STD, SUBCATEGORIA_STD, CUENTA_COL_STD]:
+                    series = df[raw_col].fillna('').astype(str)
+                    df_std[std_col] = series.str.lower().str.strip()
+                # Copiar columnas numéricas/fecha para procesar después
+                elif std_col in [IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]:
+                     df_std[std_col] = df[raw_col]
+
+            except Exception as e: st.error(f"Error proc. col '{raw_col}': {e}"); st.error(traceback.format_exc()); return None
+
+        # Procesar Tipos Específicos
         try:
-            imp_str = df['IMPORTE'].astype(str).str.replace(',', '.', regex=False)
+            imp_str = df_std[IMPORTE_STD].astype(str).str.replace(',', '.', regex=False)
             df_std[IMPORTE_STD] = pd.to_numeric(imp_str, errors='coerce')
             if df_std[IMPORTE_STD].isnull().any(): st.warning("Histórico: Importes no numéricos.")
         except Exception as e: st.error(f"Error proc. IMPORTE histórico: {e}"); return None
         try:
-            for col in ['AÑO', 'MES', 'DIA']: df_std[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
+            for col in [AÑO_STD, MES_STD, DIA_STD]: df_std[col] = pd.to_numeric(df_std[col], errors='coerce').fillna(0).astype(int)
         except Exception as e: st.error(f"Error proc. Fechas históricas: {e}"); return None
         try:
-            if CONCEPTO_STD not in df_std: df_std[CONCEPTO_STD] = ''
-            if COMERCIO_STD not in df_std: df_std[COMERCIO_STD] = ''
-            df_std[TEXTO_MODELO] = (df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]).str.strip()
+            if TEXTO_MODELO not in df_std.columns: # Evitar recrear si ya existe por error
+                 df_std[TEXTO_MODELO] = (df_std[CONCEPTO_STD] + ' ' + df_std[COMERCIO_STD]).str.strip()
         except Exception as e: st.error(f"Error creando TEXTO_MODELO: {e}"); return None
-        if CATEGORIA_STD not in df_std.columns: st.error("Falta CATEGORIA_STD."); return None
-        df_std = df_std.dropna(subset=[IMPORTE_STD, CATEGORIA_STD])
-        df_std = df_std[df_std[CATEGORIA_STD] != '']
+
+        # Filtrado final
+        df_std = df_std.dropna(subset=[IMPORTE_STD, CATEGORIA_STD, TEXTO_MODELO])
+        df_std = df_std[df_std[CATEGORIA_STD] != ''][df_std[TEXTO_MODELO] != '']
         if df_std.empty: st.warning("Histórico: No quedaron filas válidas."); return pd.DataFrame()
         return df_std
     except Exception as e: st.error(f"Error Gral parseando histórico: {e}"); st.error(traceback.format_exc()); return None
 
-@st.cache_data
+
+# **** MODIFICADO: extract_knowledge_std ****
+@st.cache_data # Mantener caché para esta función intensiva
 def extract_knowledge_std(df_std):
-    knowledge = {'categorias': [], 'subcategorias_por_cat': {}, 'comercios_por_cat': {}, 'subcat_unica_por_comercio_y_cat': {}, 'subcat_mas_frecuente_por_comercio_y_cat': {}, 'all_subcategories': [], 'all_comercios': []}
-    if df_std is None or CATEGORIA_STD not in df_std.columns or df_std.empty: return knowledge
+    """Extrae conocimiento y relaciones (incluyendo subcategoría más frecuente)."""
+    knowledge = {
+        'categorias': [], 'subcategorias_por_cat': {}, 'comercios_por_cat': {},
+        'subcat_unica_por_comercio_y_cat': {}, 'subcat_mas_frecuente_por_comercio_y_cat': {},
+        'all_subcategories': [], 'all_comercios': []
+    }
+    # **** CORRECCIÓN: Asegurar que las columnas estándar existen ****
+    required_cols_knowledge = [CATEGORIA_STD]
+    # Hacer opcionales SUBCATEGORIA_STD y COMERCIO_STD para la extracción
+    has_subcat = SUBCATEGORIA_STD in df_std.columns
+    has_comercio = COMERCIO_STD in df_std.columns
+
+    if df_std is None or not all(c in df_std.columns for c in required_cols_knowledge) or df_std.empty:
+        st.warning("Datos insuficientes o faltan columnas para extraer conocimiento (se necesita al menos CATEGORIA_STD).")
+        return knowledge
     try:
-        has_subcat = SUBCATEGORIA_STD in df_std.columns; has_comercio = COMERCIO_STD in df_std.columns
-        knowledge['categorias'] = sorted([c for c in df_std[CATEGORIA_STD].dropna().unique() if c])
+        # Limpiar NaNs en columnas clave *antes* de agrupar/iterar
+        df_clean = df_std[[CATEGORIA_STD] + ([SUBCATEGORIA_STD] if has_subcat else []) + ([COMERCIO_STD] if has_comercio else [])].copy()
+        df_clean[CATEGORIA_STD] = df_clean[CATEGORIA_STD].fillna('').astype(str).str.strip()
+        if has_subcat: df_clean[SUBCATEGORIA_STD] = df_clean[SUBCATEGORIA_STD].fillna('').astype(str).str.strip()
+        if has_comercio: df_clean[COMERCIO_STD] = df_clean[COMERCIO_STD].fillna('').astype(str).str.strip()
+        df_clean = df_clean[df_clean[CATEGORIA_STD] != ''] # Eliminar filas sin categoría
+
+        knowledge['categorias'] = sorted(df_clean[CATEGORIA_STD].unique())
         all_subcats = set(); all_comers = set()
+
         for cat in knowledge['categorias']:
-            df_cat = df_std[df_std[CATEGORIA_STD] == cat].copy()
-            knowledge['subcategorias_por_cat'][cat] = []; knowledge['comercios_por_cat'][cat] = []
-            knowledge['subcat_unica_por_comercio_y_cat'][cat] = {}; knowledge['subcat_mas_frecuente_por_comercio_y_cat'][cat] = {}
+            df_cat = df_clean[df_clean[CATEGORIA_STD] == cat]
+            knowledge['subcategorias_por_cat'][cat] = []
+            knowledge['comercios_por_cat'][cat] = []
+            knowledge['subcat_unica_por_comercio_y_cat'][cat] = {}
+            knowledge['subcat_mas_frecuente_por_comercio_y_cat'][cat] = {}
+
             if has_subcat:
-                 subcats = df_cat[SUBCATEGORIA_STD].dropna().unique(); current_subcats = sorted([s for s in subcats if s])
-                 knowledge['subcategorias_por_cat'][cat] = current_subcats; all_subcats.update(current_subcats)
+                 subcats = df_cat[SUBCATEGORIA_STD].unique()
+                 current_subcats = sorted([s for s in subcats if s]) # Filtrar vacíos
+                 knowledge['subcategorias_por_cat'][cat] = current_subcats
+                 all_subcats.update(current_subcats)
+
             if has_comercio:
-                 df_cat = df_cat[df_cat[COMERCIO_STD].notna() & (df_cat[COMERCIO_STD] != '') & (df_cat[COMERCIO_STD] != 'n/a')]
-                 comers = df_cat[COMERCIO_STD].unique(); current_comers = sorted([c for c in comers if c])
-                 knowledge['comercios_por_cat'][cat] = current_comers; all_comers.update(current_comers)
+                 # Filtrar comercios vacíos/n/a aquí también
+                 df_cat_comers = df_cat[df_cat[COMERCIO_STD] != '']
+                 comers = df_cat_comers[COMERCIO_STD].unique()
+                 current_comers = sorted([c for c in comers if c])
+                 knowledge['comercios_por_cat'][cat] = current_comers
+                 all_comers.update(current_comers)
+
                  if has_subcat:
                      for comercio in knowledge['comercios_por_cat'][cat]:
-                         df_comercio_cat = df_cat[(df_cat[COMERCIO_STD] == comercio) & (df_cat[SUBCATEGORIA_STD].notna()) & (df_cat[SUBCATEGORIA_STD] != '')]
+                         # Usar df_cat_comers que ya tiene comercios válidos
+                         df_comercio_cat = df_cat_comers[
+                             (df_cat_comers[COMERCIO_STD] == comercio) &
+                             (df_cat_comers[SUBCATEGORIA_STD] != '') # Solo contar si hay subcategoría
+                         ]
                          if not df_comercio_cat.empty:
-                             subcats_comercio = df_comercio_cat[SUBCATEGORIA_STD]; unique_subcats = subcats_comercio.unique(); comercio_key = comercio; cat_key = cat
-                             if len(unique_subcats) == 1: knowledge['subcat_unica_por_comercio_y_cat'][cat_key][comercio_key] = unique_subcats[0]
+                             subcats_comercio = df_comercio_cat[SUBCATEGORIA_STD]
+                             unique_subcats = subcats_comercio.unique()
+                             comercio_key = comercio; cat_key = cat
+
+                             if len(unique_subcats) == 1:
+                                 knowledge['subcat_unica_por_comercio_y_cat'][cat_key][comercio_key] = unique_subcats[0]
+
                              if len(subcats_comercio) > 0:
                                  try:
                                      most_frequent = subcats_comercio.value_counts().idxmax()
                                      knowledge['subcat_mas_frecuente_por_comercio_y_cat'][cat_key][comercio_key] = most_frequent
-                                 except Exception:
-                                     if unique_subcats: knowledge['subcat_mas_frecuente_por_comercio_y_cat'][cat_key][comercio_key] = unique_subcats[0]
-        knowledge['all_subcategories'] = sorted(list(all_subcats)); knowledge['all_comercios'] = sorted(list(all_comers))
+                                 except Exception: # Fallback si hay error en idxmax (raro)
+                                     if len(unique_subcats) > 0: # Usar la primera única si existe
+                                          knowledge['subcat_mas_frecuente_por_comercio_y_cat'][cat_key][comercio_key] = unique_subcats[0]
+
+
+        knowledge['all_subcategories'] = sorted(list(all_subcats))
+        knowledge['all_comercios'] = sorted(list(all_comers))
+
     except Exception as e_kg: st.error(f"Error extrayendo conocimiento: {e_kg}"); st.error(traceback.format_exc())
     return knowledge
 
 @st.cache_resource
 def train_classifier_std(df_std):
+    # ... (sin cambios) ...
     report = "Modelo no entrenado."; model = None; vectorizer = None
     required = [TEXTO_MODELO, CATEGORIA_STD]
     if df_std is None or df_std.empty or not all(c in df_std.columns for c in required): return model, vectorizer, report
@@ -182,6 +250,7 @@ def train_classifier_std(df_std):
     return model, vectorizer, report
 
 def standardize_data_with_mapping(df_raw, mapping):
+    # ... (sin cambios) ...
     try:
         df_std = pd.DataFrame(); df = df_raw.copy()
         df.columns = [str(col).strip() for col in df.columns]
@@ -249,6 +318,7 @@ def standardize_data_with_mapping(df_raw, mapping):
     except Exception as e: st.error(f"Error Gral aplicando mapeo '{mapping.get('bank_name', '?')}': {e}"); st.error(traceback.format_exc()); return None
 
 def parse_accumulated_db_for_training(df_db):
+    # ... (código sin cambios) ...
     if not isinstance(df_db, pd.DataFrame) or df_db.empty: st.error("BD Acumulada vacía."); return None
     df = df_db.copy(); df.columns = [str(col).upper().strip() for col in df.columns]
     cat_col_found = next((c for c in [CATEGORIA_STD, CATEGORIA_PREDICHA, 'CATEGORIA', 'CATEGORÍA', 'CATEGORIA_X'] if c in df.columns), None)
@@ -273,11 +343,12 @@ def parse_accumulated_db_for_training(df_db):
     return df_train
 
 def get_last_transaction_dates(df_accumulated):
+    # ... (código sin cambios) ...
     if df_accumulated is None or df_accumulated.empty: return pd.DataFrame(columns=['Cuenta', 'Última Transacción'])
     cuenta_col = next((c for c in [CUENTA_COL_STD, CUENTA_COL_ORIG.upper(), 'CUENTA'] if c in df_accumulated.columns), None)
     if not cuenta_col: return pd.DataFrame(columns=['Cuenta', 'Última Transacción'])
     df_temp = df_accumulated.copy(); date_cols = [AÑO_STD, MES_STD, DIA_STD]
-    if not all(col in df_temp.columns for col in date_cols): st.error(f"Faltan cols fecha en BD."); return pd.DataFrame(columns=['Cuenta', 'Última Transacción'])
+    if not all(col in df_temp.columns for col in date_cols): return pd.DataFrame(columns=['Cuenta', 'Última Transacción'])
     for col in date_cols: df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce').fillna(0)
     try: df_temp['FECHA_COMPLETA'] = pd.to_datetime(df_temp[date_cols].rename(columns={AÑO_STD: 'year', MES_STD: 'month', DIA_STD: 'day'}), errors='coerce')
     except ValueError as e_dt_conv: st.error(f"Error construyendo fechas: {e_dt_conv}"); return pd.DataFrame(columns=['Cuenta', 'Última Transacción'])
@@ -292,7 +363,7 @@ def get_last_transaction_dates(df_accumulated):
 # ------------------------------------------------------------------------------------
 
 # --- Streamlit UI ---
-st.set_page_config(layout="wide"); st.title("🏦 Categorizador Bancario Inteligente v5.3")
+st.set_page_config(layout="wide"); st.title("🏦 Categorizador Bancario Inteligente v5.4")
 st.caption(f"Config: `{CONFIG_FILENAME}`, BD: `{DB_FILENAME}`")
 
 # --- Carga BD (Sidebar) ---
@@ -322,12 +393,13 @@ if uploaded_db_file:
                          if col in df_db_loaded.columns: df_db_loaded[col] = df_db_loaded[col].fillna('')
                     st.session_state.accumulated_data = df_db_loaded; st.session_state[db_uploader_key] = uploaded_db_file.file_id
                     st.sidebar.success(f"BD cargada ({len(df_db_loaded)}).")
-                    if not st.session_state.knowledge_loaded:
-                         if CATEGORIA_STD in st.session_state.accumulated_data.columns:
-                              st.session_state.learned_knowledge = extract_knowledge_std(st.session_state.accumulated_data)
-                              st.session_state.knowledge_loaded = bool(st.session_state.learned_knowledge.get('categorias'))
-                              if st.session_state.knowledge_loaded: st.sidebar.info("Conocimiento extraído de BD.")
-                         else: st.sidebar.warning("BD sin CATEGORIA_STD.")
+                    # **** CORRECCIÓN: Llamar a extract_knowledge_std SIEMPRE después de cargar BD ****
+                    if CATEGORIA_STD in st.session_state.accumulated_data.columns:
+                         st.session_state.learned_knowledge = extract_knowledge_std(st.session_state.accumulated_data)
+                         st.session_state.knowledge_loaded = bool(st.session_state.learned_knowledge.get('categorias'))
+                         if st.session_state.knowledge_loaded: st.sidebar.info("Conocimiento extraído/actualizado de BD.")
+                         else: st.sidebar.warning("No se pudo extraer conocimiento de BD.")
+                    else: st.sidebar.warning("BD cargada sin CATEGORIA_STD para extraer conocimiento.")
                     st.rerun()
                 else: st.sidebar.error(f"DB inválida. Faltan: {missing_db_cols}"); st.session_state[db_uploader_key] = None
         else: st.sidebar.error("No se pudo leer BD."); st.session_state[db_uploader_key] = None
@@ -338,7 +410,7 @@ tab1, tab2 = st.tabs(["⚙️ Configuración y Entrenamiento", "📊 Categorizac
 # --- Tab 1: Configuración y Entrenamiento ---
 with tab1:
     st.header("Configuración y Entrenamiento")
-    col1a, col1b = st.columns([1, 2])
+    col1a, col1b = st.columns([1, 2]) # Dar más espacio a Formatos
     with col1a:
         st.subheader("Cargar/Descargar Config")
         st.write(f"Gestiona `{CONFIG_FILENAME}`."); uploaded_config_file_f1 = st.file_uploader(f"Cargar Config", type="json", key="config_loader_f1")
@@ -350,6 +422,7 @@ with tab1:
                     if not isinstance(cfg,dict): ok=False; msg="No dict."
                     elif 'bank_mappings' not in cfg or not isinstance(cfg['bank_mappings'], dict): ok=False; msg+=" Falta/Inv 'bank_mappings'."
                     elif 'learned_knowledge' not in cfg or not isinstance(cfg['learned_knowledge'], dict): ok=False; msg+=" Falta/Inv 'learned_knowledge'."
+                    # **** CORRECCIÓN VALIDACIÓN: Incluir all_subcategories y all_comercios ****
                     elif not all(key in cfg['learned_knowledge'] for key in ['categorias', 'subcategorias_por_cat', 'comercios_por_cat', 'subcat_unica_por_comercio_y_cat', 'subcat_mas_frecuente_por_comercio_y_cat', 'all_subcategories', 'all_comercios']): ok=False; msg+=" Faltan claves knowledge."
                     if ok:
                         st.session_state.bank_mappings = cfg['bank_mappings']; st.session_state.learned_knowledge = cfg['learned_knowledge']
@@ -369,42 +442,50 @@ with tab1:
 
         st.divider()
         st.subheader("(Re)Entrenar Modelo")
-        st.write("Usa la BD Acumulada.")
+        st.write("Usa la BD Acumulada (cargada en sidebar).")
         if st.session_state.accumulated_data.empty: st.warning("Carga la BD.")
         elif st.button("🧠 Entrenar/Reentrenar con BD", key="train_db_f1b"):
              with st.spinner("Preparando y entrenando..."):
                 df_to_train = parse_accumulated_db_for_training(st.session_state.accumulated_data.copy())
                 if df_to_train is not None and not df_to_train.empty:
                     st.success("Datos BD OK.")
-                    st.session_state.learned_knowledge = extract_knowledge_std(df_to_train)
+                    st.session_state.learned_knowledge = extract_knowledge_std(df_to_train) # Actualizar conocimiento
                     st.session_state.knowledge_loaded = True
                     st.sidebar.success("Conocimiento Actualizado (BD)")
+                    # **** CORRECCIÓN: Mostrar en expander ****
+                    # with st.sidebar.expander("Categorías (BD)"): st.write(st.session_state.learned_knowledge['categorias'])
                     model, vectorizer, report = train_classifier_std(df_to_train)
                     if model and vectorizer:
                         st.session_state.model = model; st.session_state.vectorizer = vectorizer
                         st.session_state.model_trained = True; st.session_state.training_report = report
                         st.success(f"¡Modelo entrenado!")
-                        # **** CORRECCIÓN AQUÍ ****
                         st.sidebar.subheader("Evaluación Modelo")
                         with st.sidebar.expander("Ver Informe"): # Línea separada
                              st.text(st.session_state.training_report)
-                        # **** FIN CORRECCIÓN ****
                     else: st.error(f"Fallo entrenamiento."); st.session_state.model_trained = False; st.session_state.training_report = report; st.sidebar.error("Entrenamiento Fallido"); st.sidebar.text(st.session_state.training_report)
                 else: st.error("No se prepararon datos de BD."); st.session_state.model_trained = False
-        # Mostrar Conocimiento Aprendido/Cargado
+        # **** CORRECCIÓN: Mostrar Conocimiento Base Actual ****
         st.divider()
         st.subheader("Conocimiento Base Actual")
-        # **** CORRECCIÓN: Mostrar conocimiento aquí ****
         knowledge_display = st.session_state.get('learned_knowledge', {})
         if knowledge_display and knowledge_display.get('categorias'):
              st.write(f"**Categorías ({len(knowledge_display['categorias'])}):**")
-             st.write(knowledge_display['categorias'])
-             with st.expander(f"Subcategorías ({len(knowledge_display.get('all_subcategories',[]))})"):
-                  st.json(knowledge_display.get('subcategorias_por_cat', {}), expanded=False)
-             with st.expander(f"Comercios ({len(knowledge_display.get('all_comercios',[]))})"):
-                  st.json(knowledge_display.get('comercios_por_cat', {}), expanded=False)
-        else:
-             st.info("No hay conocimiento base cargado o aprendido.")
+             st.dataframe(pd.DataFrame(knowledge_display['categorias'], columns=['Categoría']), use_container_width=True, hide_index=True)
+
+             # Mostrar Subcategorías y Comercios (más útil que los dict internos)
+             all_subs = knowledge_display.get('all_subcategories', [])
+             all_coms = knowledge_display.get('all_comercios', [])
+             col_k1, col_k2 = st.columns(2)
+             with col_k1:
+                  with st.expander(f"Subcategorías Conocidas ({len(all_subs)})"):
+                       st.dataframe(pd.DataFrame(all_subs, columns=['Subcategoría']), use_container_width=True, hide_index=True)
+             with col_k2:
+                   with st.expander(f"Comercios Conocidos ({len(all_coms)})"):
+                       st.dataframe(pd.DataFrame(all_coms, columns=['Comercio']), use_container_width=True, hide_index=True)
+             # Opcional: Mostrar las relaciones internas si es útil para debug avanzado
+             # with st.expander("Subcategorías por Categoría (Detalle)"): st.json(knowledge_display.get('subcategorias_por_cat', {}))
+             # with st.expander("Comercios por Categoría (Detalle)"): st.json(knowledge_display.get('comercios_por_cat', {}))
+        else: st.info("No hay conocimiento base cargado o aprendido.")
 
 
     with col1b:
@@ -439,7 +520,7 @@ with tab1:
                     st.markdown("**Importe:**"); val_map_decimal_sep = st.text_input("Separador Decimal", value=saved_mapping.get('decimal_sep', ','), key=f"map_decimal_{selected_bank_learn}")
                     val_map_thousands_sep = st.text_input("Separador Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
 
-                # --- Botón Guardar Mapeo (Lógica corregida adentro) ---
+                # --- Botón Guardar Mapeo ---
                 if st.button(f"💾 Guardar Mapeo {selected_bank_learn}", key="save_mapping_f2"):
                     final_mapping_cols = {}
                     if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto
@@ -449,8 +530,7 @@ with tab1:
                     if not map_single_date and map_mes: final_mapping_cols[MES_STD] = map_mes
                     if not map_single_date and map_dia: final_mapping_cols[DIA_STD] = map_dia
                     if map_comercio: final_mapping_cols[COMERCIO_STD] = map_comercio
-
-                    # Validación Corregida
+                    # Validación (Separada)
                     valid = True; current_fmt = map_formato_fecha
                     if not final_mapping_cols.get(CONCEPTO_STD): st.error("Mapea CONCEPTO."); valid=False
                     if not final_mapping_cols.get(IMPORTE_STD): st.error("Mapea IMPORTE."); valid=False
@@ -461,14 +541,10 @@ with tab1:
                         if not final_mapping_cols.get(AÑO_STD): st.error("Mapea AÑO."); valid=False
                         if not final_mapping_cols.get(MES_STD): st.error("Mapea MES."); valid=False
                         if not final_mapping_cols.get(DIA_STD): st.error("Mapea DIA."); valid=False
-
+                    # Si es válido, guardar
                     if valid:
-                        # Construir mapping_to_save DENTRO
-                        current_decimal_sep = val_map_decimal_sep
-                        current_thousands_sep = val_map_thousands_sep
-                        mapping_to_save = {'bank_name': selected_bank_learn, 'columns': final_mapping_cols, 'decimal_sep': current_decimal_sep.strip(), 'thousands_sep': current_thousands_sep.strip() or None}
+                        mapping_to_save = {'bank_name': selected_bank_learn, 'columns': final_mapping_cols, 'decimal_sep': val_map_decimal_sep.strip(), 'thousands_sep': val_map_thousands_sep.strip() or None}
                         if map_single_date and current_fmt: mapping_to_save['date_format'] = current_fmt.strip()
-
                         st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
                         st.success(f"¡Mapeo {selected_bank_learn} guardado!"); st.rerun()
                     else: st.warning("Revisa errores.")
@@ -523,7 +599,7 @@ with tab2:
                                              known_comers_for_cat = knowledge['comercios_por_cat'].get(pred_cat_lower, [])
                                              if input_comercio_lower and known_comers_for_cat:
                                                  match_result = process.extractOne(input_comercio_lower, known_comers_for_cat)
-                                                 if match_result and match_result[1] >= FUZZY_MATCH_THRESHOLD: comercio_final = match_result[0]; best_match_comercio = match_result[0]; debug_step += f"->ComM:'{comercio_final}'({match_result[1]})"
+                                                 if match_result and match_result[1] >= FUZZY_MATCH_THRESHOLD: comercio_final = match_result[0]; best_match_comercio = match_result[0]; #debug_step += f"->ComM:'{comercio_final}'({match_result[1]})"
                                              pred_comercios_final.append(comercio_final.capitalize())
                                              subcat_final = ''; comercio_lookup_key = best_match_comercio if best_match_comercio else input_comercio_lower
                                              subcat_msg = "->Sub:"
@@ -556,35 +632,29 @@ with tab2:
                                          # --- Botón Añadir a BD y Lógica Duplicados ---
                                          if st.button(f"➕ Añadir '{uploaded_final_file.name}' a BD", key=f"add_db_{uploaded_final_file.name}"):
                                              current_db = st.session_state.get('accumulated_data', pd.DataFrame())
+                                             # Preparar df_to_append con las columnas finales de la BD
                                              db_cols_to_keep = DB_FINAL_COLS + [c for c in df_pred.columns if c.startswith('ORIG_')]
-                                             cuenta_col_append = next((c for c in [CUENTA_COL_STD, CUENTA_COL_ORIG.upper(), 'CUENTA'] if c in df_pred.columns), None) # Usar cuenta estandarizada o original
+                                             cuenta_col_append = next((c for c in [CUENTA_COL_STD, CUENTA_COL_ORIG.upper()] if c in df_pred.columns), None)
                                              if cuenta_col_append and cuenta_col_append not in db_cols_to_keep: db_cols_to_keep.append(cuenta_col_append)
                                              final_db_cols_append = [col for col in db_cols_to_keep if col in df_pred.columns]
                                              df_to_append = df_pred[final_db_cols_append].copy()
 
-                                             if current_db.empty:
-                                                 new_transactions_only = df_to_append; num_added = len(new_transactions_only)
+                                             if current_db.empty: new_transactions_only = df_to_append; num_added = len(new_transactions_only)
                                              else:
                                                  st.write("Detectando duplicados..."); key_cols = [AÑO_STD, MES_STD, DIA_STD, IMPORTE_STD, CONCEPTO_STD]
                                                  acc_col_db = next((c for c in [CUENTA_COL_STD, CUENTA_COL_ORIG.upper(), 'CUENTA'] if c in current_db.columns), None)
-                                                 if acc_col_db and cuenta_col_append: # Solo añadir cuenta a la clave si existe en ambos
-                                                    if cuenta_col_append != acc_col_db: # Renombrar si es necesario para comparar
-                                                        df_to_append = df_to_append.rename(columns={cuenta_col_append: acc_col_db})
-                                                    key_cols.append(acc_col_db)
-                                                 elif acc_col_db or cuenta_col_append: st.warning("Col. cuenta no consistente, chequeo sin ella.")
-
-                                                 df1 = current_db.copy(); df2 = df_to_append.copy() # Usar df_to_append ya renombrado si aplica
-                                                 account_key_col = acc_col_db if acc_col_db and cuenta_col_append else None # Definir la clave de cuenta final
-
+                                                 acc_col_new = next((c for c in [CUENTA_COL_STD, CUENTA_COL_ORIG.upper(), 'CUENTA'] if c in df_to_append.columns), None)
+                                                 account_key_col = None
+                                                 if acc_col_db and acc_col_new: key_cols.append(acc_col_db); account_key_col = acc_col_db
+                                                 df1 = current_db.copy(); df2 = df_to_append.copy()
+                                                 if acc_col_db and acc_col_new and acc_col_db != acc_col_new: df2 = df2.rename(columns={acc_col_new: acc_col_db})
                                                  for df_temp in [df1, df2]:
                                                      if IMPORTE_STD in df_temp.columns: df_temp[IMPORTE_STD] = pd.to_numeric(df_temp[IMPORTE_STD], errors='coerce').round(2)
                                                      for col in key_cols:
                                                           if col not in df_temp.columns: df_temp[col] = np.nan
                                                           if col in [AÑO_STD, MES_STD, DIA_STD]: df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce').astype('Int64')
-                                                          elif col in [CONCEPTO_STD] or (account_key_col and col==account_key_col) : df_temp[col] = df_temp[col].fillna('').astype(str) # Aplicar a cuenta solo si está en keys
-
+                                                          elif col in [CONCEPTO_STD] or (account_key_col and col==account_key_col) : df_temp[col] = df_temp[col].fillna('').astype(str)
                                                  df1 = df1.dropna(subset=key_cols); df2 = df2.dropna(subset=key_cols)
-
                                                  if df1.empty and not df2.empty: new_transactions_only = df2
                                                  elif not df1.empty and not df2.empty:
                                                       merged = df2.merge(df1[key_cols].drop_duplicates(), on=key_cols, how='left', indicator=True)
@@ -592,9 +662,12 @@ with tab2:
                                                  else: new_transactions_only = pd.DataFrame(columns=df2.columns)
                                                  num_added = len(new_transactions_only)
                                              if num_added > 0:
-                                                 st.write(f"Añadiendo {num_added} nuevas."); combined_cols = current_db.columns.union(new_transactions_only.columns)
-                                                 current_db_reindexed = current_db.reindex(columns=combined_cols); new_transactions_reindexed = new_transactions_only.reindex(columns=combined_cols)
-                                                 st.session_state.accumulated_data = pd.concat([current_db_reindexed, new_transactions_reindexed], ignore_index=True).fillna('')
+                                                 st.write(f"Añadiendo {num_added} nuevas.")
+                                                 # Asegurar que ambas DFs tengan todas las columnas antes de concatenar
+                                                 combined_cols = current_db.columns.union(new_transactions_only.columns)
+                                                 current_db_reindexed = current_db.reindex(columns=combined_cols)
+                                                 new_transactions_reindexed = new_transactions_only.reindex(columns=combined_cols)
+                                                 st.session_state.accumulated_data = pd.concat([current_db_reindexed, new_transactions_reindexed], ignore_index=True).fillna('') # Rellenar NaNs introducidos por reindex
                                                  st.success(f"{num_added} trans. NUEVAS añadidas."); st.rerun()
                                              else: st.info("No se añadieron filas (0 nuevas o duplicadas)."); st.rerun()
                                     else: st.warning("No quedaron filas válidas para categorizar.")
@@ -608,25 +681,26 @@ with tab2:
                  else: st.error("Fallo en la estandarización usando el mapeo.")
 
     st.divider()
+    # --- Sub-Sección: Ver/Gestionar Base de Datos Acumulada ---
     st.subheader("Base de Datos Acumulada (Editable)")
     db_state_tab = st.session_state.get('accumulated_data', pd.DataFrame())
     if db_state_tab is not None and not db_state_tab.empty:
         st.write(f"({len(db_state_tab)} filas). Doble clic para editar Cat/Subcat/Comercio.")
         knowledge = st.session_state.get('learned_knowledge', {})
+        # **** CORRECCIÓN: Usar listas planas correctas ****
         categorias_options = knowledge.get('categorias', [])
         all_subcats_options = knowledge.get('all_subcategories', []) # Usar lista plana
         all_comers_options = knowledge.get('all_comercios', [])       # Usar lista plana
 
-        # Crear config dinámicamente asegurando que las columnas existen
-        column_config_editor = {}
-        if CATEGORIA_PREDICHA in db_state_tab.columns:
-             column_config_editor[CATEGORIA_PREDICHA] = st.column_config.SelectboxColumn("Categoría", width="medium", options=categorias_options, required=False)
-        if SUBCATEGORIA_PREDICHA in db_state_tab.columns:
-             column_config_editor[SUBCATEGORIA_PREDICHA] = st.column_config.SelectboxColumn("Subcategoría", width="medium", options=all_subcats_options, required=False)
-        if COMERCIO_PREDICHO in db_state_tab.columns:
-             column_config_editor[COMERCIO_PREDICHO] = st.column_config.SelectboxColumn("Comercio Estd.", width="medium", options=all_comers_options, required=False)
+        # Asegurar que las columnas editables existan antes de configurar el editor
+        for col in [CATEGORIA_PREDICHA, SUBCATEGORIA_PREDICHA, COMERCIO_PREDICHO]:
+            if col not in db_state_tab.columns: db_state_tab[col] = ''
 
-        # Identificar columna de cuenta para mostrar
+        column_config_editor = {
+            CATEGORIA_PREDICHA: st.column_config.SelectboxColumn("Categoría", width="medium", options=categorias_options, required=False),
+            SUBCATEGORIA_PREDICHA: st.column_config.SelectboxColumn("Subcategoría", width="medium", options=all_subcats_options, required=False),
+            COMERCIO_PREDICHO: st.column_config.SelectboxColumn("Comercio Estd.", width="medium", options=all_comers_options, required=False)
+        }
         cuenta_col_display = next((c for c in [CUENTA_COL_STD, CUENTA_COL_ORIG.upper(), 'CUENTA'] if c in db_state_tab.columns), None)
         cols_to_edit_base = [CATEGORIA_PREDICHA, SUBCATEGORIA_PREDICHA, COMERCIO_PREDICHO, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
         cols_to_show_edit = [col for col in cols_to_edit_base if col in db_state_tab.columns]
@@ -635,36 +709,37 @@ with tab2:
         cols_to_show_edit += sorted([col for col in db_state_tab.columns if col not in cols_to_show_edit and col != TEXTO_MODELO])
         cols_to_show_edit = [col for col in cols_to_show_edit if col in db_state_tab.columns]
 
-        # **** Usar st.data_editor ****
+        # **** CORRECCIÓN: Usar st.data_editor ****
         edited_df = st.data_editor(
-            db_state_tab[cols_to_show_edit].copy(), # Pasar copia para evitar modificar el estado directamente
+            db_state_tab[cols_to_show_edit].copy(), # Pasar copia para editarla
             key="db_editor_main",
             column_config=column_config_editor,
-            num_rows="dynamic", # Permitir añadir/borrar
+            num_rows="dynamic",
             use_container_width=True,
-            # disabled=[...] # Opcional: deshabilitar columnas no editables
+            # disabled=[...] # Opcional
         )
 
         # Botón para guardar cambios del editor
         if st.button("💾 Confirmar Cambios en BD", key="save_edited_db"):
-            # Actualizar la base de datos en session_state con el DF editado
-            # Podríamos hacer un merge basado en índice si `num_rows` no fuera "dynamic"
-            # Con "dynamic", lo más seguro es reemplazar todo.
-            st.session_state.accumulated_data = edited_df.copy() # Reemplazar
+            st.session_state.accumulated_data = edited_df.copy() # Reemplazar con la editada
             st.success("Cambios guardados en memoria. ¡Descarga la BD actualizada (Sidebar)!")
+            # **** Re-extraer conocimiento DESPUÉS de editar ****
+            st.session_state.learned_knowledge = extract_knowledge_std(st.session_state.accumulated_data)
+            st.session_state.knowledge_loaded = True # Asegurar que está marcado
             st.rerun()
-    else:
-        st.info("BD acumulada vacía.")
+    else: st.info("BD acumulada vacía.")
+
 
 # --- Sidebar Info y Estado ---
 st.sidebar.divider(); st.sidebar.header("Acerca de")
 st.sidebar.info("Categorizador v5.3"); st.sidebar.divider(); st.sidebar.subheader("Estado Actual")
-model_ready_sidebar = st.session_state.get('model_trained', False); knowledge_ready_sidebar = st.session_state.get('knowledge_loaded', False)
+model_ready_sidebar = st.session_state.get('model_trained', False)
+knowledge_ready_sidebar = st.session_state.get('knowledge_loaded', False)
 if model_ready_sidebar: st.sidebar.success("✅ Modelo Entrenado")
 elif knowledge_ready_sidebar: st.sidebar.info("ℹ️ Conocimiento Cargado")
 else: st.sidebar.warning("❌ Sin Modelo/Conocimiento")
 if st.session_state.get('bank_mappings', {}): st.sidebar.success(f"✅ Mapeos ({len(st.session_state.bank_mappings)})")
-else: st.sidebar.warning("❌ Sin Mapeos")
+else: st.sidebar.warning("❌ Sin Mapeos Bancarios")
 db_state_sidebar = st.session_state.get('accumulated_data', pd.DataFrame())
 if db_state_sidebar is not None and not db_state_sidebar.empty: st.sidebar.success(f"✅ BD ({len(db_state_sidebar)} filas)")
 else: st.sidebar.info("ℹ️ BD Vacía")
@@ -677,7 +752,7 @@ if db_state_sidebar is not None and not db_state_sidebar.empty:
         cols_to_export_db = [col for col in DB_FINAL_COLS if col in db_state_sidebar.columns]
         if cuenta_col_export and cuenta_col_export not in cols_to_export_db: cols_to_export_db.append(cuenta_col_export)
         cols_to_export_db += [col for col in db_state_sidebar.columns if col.startswith('ORIG_') and col != cuenta_col_export]
-        cols_to_export_db = [col for col in cols_to_export_db if col in db_state_sidebar.columns]
+        cols_to_export_db = [col for col in cols_to_export_db if col in db_state_sidebar.columns] # Filtrar existentes
         df_to_export = db_state_sidebar[cols_to_export_db].copy()
         db_csv_output_sb = df_to_export.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
         st.sidebar.download_button(label=f"💾 Descargar BD (CSV)", data=db_csv_output_sb, file_name=DB_FILENAME, mime='text/csv', key='download_db_csv_sb')
