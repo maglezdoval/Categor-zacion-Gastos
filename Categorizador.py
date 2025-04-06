@@ -434,15 +434,33 @@ with tab1:
                 val_map_thousands_sep = st.text_input("Sep. Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
             if st.button(f"💾 Guardar Mapeo {selected_bank_learn}", key="save_mapping_f2"):
                 final_mapping_cols = {}; valid = True; current_fmt = map_formato_fecha
-                if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto; else: st.error("Mapea CONCEPTO."); valid=False
-                if map_importe: final_mapping_cols[IMPORTE_STD] = map_importe; else: st.error("Mapea IMPORTE."); valid=False
+                if map_concepto: 
+                    final_mapping_cols[CONCEPTO_STD] = map_concepto; 
+                else: 
+                    st.error("Mapea CONCEPTO."); valid=False
+                if map_importe: 
+                    final_mapping_cols[IMPORTE_STD] = map_importe; 
+                else: 
+                    st.error("Mapea IMPORTE."); valid=False
                 if map_single_date:
-                    if map_fecha_unica: final_mapping_cols[FECHA_STD] = map_fecha_unica; else: st.error("Mapea FECHA."); valid=False
+                    if map_fecha_unica: 
+                        final_mapping_cols[FECHA_STD] = map_fecha_unica; 
+                    else: 
+                        st.error("Mapea FECHA."); valid=False
                     if not current_fmt: st.error("Especifica formato."); valid=False
                 else:
-                    if map_año: final_mapping_cols[AÑO_STD] = map_año; else: st.error("Mapea AÑO."); valid=False
-                    if map_mes: final_mapping_cols[MES_STD] = map_mes; else: st.error("Mapea MES."); valid=False
-                    if map_dia: final_mapping_cols[DIA_STD] = map_dia; else: st.error("Mapea DIA."); valid=False
+                    if map_año: 
+                        final_mapping_cols[AÑO_STD] = map_año; 
+                    else: 
+                        st.error("Mapea AÑO."); valid=False
+                    if map_mes: 
+                        final_mapping_cols[MES_STD] = map_mes; 
+                    else: 
+                        st.error("Mapea MES."); valid=False
+                    if map_dia: 
+                        final_mapping_cols[DIA_STD] = map_dia; 
+                    else: 
+                        st.error("Mapea DIA."); valid=False
                 if map_comercio: final_mapping_cols[COMERCIO_STD] = map_comercio
                 if valid:
                     mapping_to_save = {'bank_name': selected_bank_learn, 'columns': final_mapping_cols, 'decimal_sep': val_map_decimal_sep.strip(), 'thousands_sep': val_map_thousands_sep.strip() or None}
