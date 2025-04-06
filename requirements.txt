@@ -1,4 +1,4 @@
-thefuzz
+fuzzywuzzy
 python-Levenshtein
 openpyxl
 xlrd
