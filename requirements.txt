@@ -1,7 +1,8 @@
-streamlit
-pandas
-scikit-learn
-openpyxl
-xlrd
 thefuzz
 python-Levenshtein
+openpyxl
+xlrd
+scikit-learn
+pandas
+streamlit
+numpy
