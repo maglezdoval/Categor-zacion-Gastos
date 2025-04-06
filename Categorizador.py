@@ -7,16 +7,25 @@ from sklearn.metrics import classification_report
 import io
 import numpy as np
 from datetime import datetime
-import json # Para guardar/cargar mapeos y conocimiento
-import traceback # Para imprimir errores detallados
+import json
+import traceback
 import os
+from collections import Counter # Para encontrar la subcategoría más común por comercio
 
 # --- Constantes ---
 CONCEPTO_STD = 'CONCEPTO_STD'; COMERCIO_STD = 'COMERCIO_STD'; IMPORTE_STD = 'IMPORTE_STD'
 AÑO_STD = 'AÑO'; MES_STD = 'MES'; DIA_STD = 'DIA'; FECHA_STD = 'FECHA_STD'
 CATEGORIA_STD = 'CATEGORIA_STD'; SUBCATEGORIA_STD = 'SUBCATEGORIA_STD'
 TEXTO_MODELO = 'TEXTO_MODELO'; CATEGORIA_PREDICHA = 'CATEGORIA_PREDICHA'
-DB_STD_COLS = [CATEGORIA_PREDICHA, CONCEPTO_STD, COMERCIO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD] # Columnas para la BD final
+# **** NUEVAS COLUMNAS PREDICHAS ****
+SUBCATEGORIA_PREDICHA = 'SUBCATEGORIA_PREDICHA'
+COMERCIO_PREDICHO = 'COMERCIO_PREDICHO' # Versión estandarizada/predicha
+
+# Columnas estándar ESPERADAS en la base de datos acumulada (para entrenamiento)
+DB_TRAIN_COLS = [CONCEPTO_STD, COMERCIO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD, CATEGORIA_STD, SUBCATEGORIA_STD]
+# **** ACTUALIZADO: Columnas a MOSTRAR/GUARDAR en la base de datos final ****
+DB_FINAL_COLS = [CATEGORIA_PREDICHA, SUBCATEGORIA_PREDICHA, COMERCIO_PREDICHO, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
+
 MANDATORY_STD_COLS = [CONCEPTO_STD, IMPORTE_STD, FECHA_STD]
 OPTIONAL_STD_COLS = [COMERCIO_STD]
 CONFIG_FILENAME = "Configuracion_Categorizador.json"
@@ -32,12 +41,20 @@ if 'training_report' not in st.session_state: st.session_state.training_report =
 if 'config_loader_processed_id' not in st.session_state: st.session_state.config_loader_processed_id = None
 if 'accumulated_data' not in st.session_state: st.session_state.accumulated_data = pd.DataFrame()
 if 'db_loader_processed_id' not in st.session_state: st.session_state.db_loader_processed_id = None
-if 'learned_knowledge' not in st.session_state: st.session_state.learned_knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
+# **** Modificado: learned_knowledge ahora contendrá más detalle ****
+if 'learned_knowledge' not in st.session_state:
+    st.session_state.learned_knowledge = {
+        'categorias': [],
+        'subcategorias_por_cat': {}, # Lista de subcats por categoría
+        'comercios_por_cat': {},     # Lista de comercios por categoría
+        'subcat_por_comercio_y_cat': {} # Dict[cat][comercio] -> subcat (solo si es única)
+    }
+
 
 # --- Funciones ---
 @st.cache_data
 def read_uploaded_file(uploaded_file):
-    """Lee CSV o Excel y devuelve DF y columnas."""
+    # ... (Sin cambios respecto a la versión anterior) ...
     if uploaded_file is None: return None, []
     try:
         file_name = uploaded_file.name; bytes_data = uploaded_file.getvalue(); df = None
@@ -70,7 +87,7 @@ def read_uploaded_file(uploaded_file):
     except Exception as e: st.error(f"Error Gral leyendo '{uploaded_file.name if uploaded_file else ''}': {e}"); st.error(traceback.format_exc()); return None, []
 
 def parse_historic_categorized(df_raw):
-    """Parsea el Gastos.csv inicial para entrenamiento."""
+    # ... (Sin cambios respecto a la versión anterior) ...
     try:
         if not isinstance(df_raw, pd.DataFrame): st.error("Parse Histórico: No es DF."); return None
         df = df_raw.copy(); df.columns = [str(col).upper().strip() for col in df.columns]
@@ -116,24 +133,65 @@ def parse_historic_categorized(df_raw):
         return df_std
     except Exception as e: st.error(f"Error Gral parseando histórico: {e}"); st.error(traceback.format_exc()); return None
 
+# **** MODIFICADO: extract_knowledge_std ****
 @st.cache_data
 def extract_knowledge_std(df_std):
-    knowledge = {'categorias': [], 'subcategorias': {}, 'comercios': {}}
-    if df_std is None or CATEGORIA_STD not in df_std.columns or df_std.empty: return knowledge
+    """Extrae conocimiento y relaciones del DF estandarizado."""
+    knowledge = {
+        'categorias': [],
+        'subcategorias_por_cat': {},
+        'comercios_por_cat': {},
+        'subcat_por_comercio_y_cat': {} # Nuevo: Dict[cat][comercio] -> subcat (solo si única)
+    }
+    if df_std is None or CATEGORIA_STD not in df_std.columns or df_std.empty:
+        st.warning("No hay datos válidos para extraer conocimiento.")
+        return knowledge
     try:
+        # Asegurar que las columnas necesarias para las relaciones existen
+        has_subcat = SUBCATEGORIA_STD in df_std.columns
+        has_comercio = COMERCIO_STD in df_std.columns
+
         knowledge['categorias'] = sorted([c for c in df_std[CATEGORIA_STD].dropna().unique() if c])
+
         for cat in knowledge['categorias']:
-            subcat_col = SUBCATEGORIA_STD; knowledge['subcategorias'][cat] = []
-            if subcat_col in df_std.columns:
-                 subcats = df_std.loc[df_std[CATEGORIA_STD] == cat, subcat_col].dropna().unique()
-                 knowledge['subcategorias'][cat] = sorted([s for s in subcats if s])
-            comercio_col = COMERCIO_STD; knowledge['comercios'][cat] = []
-            if comercio_col in df_std.columns:
-                 comers = df_std.loc[df_std[CATEGORIA_STD] == cat, comercio_col].dropna().unique()
-                 knowledge['comercios'][cat] = sorted([c for c in comers if c and c != 'n/a'])
-    except Exception as e_kg: st.error(f"Error extrayendo conocimiento: {e_kg}")
+            df_cat = df_std[df_std[CATEGORIA_STD] == cat]
+
+            # Subcategorías generales por categoría
+            knowledge['subcategorias_por_cat'][cat] = []
+            if has_subcat:
+                 subcats = df_cat[SUBCATEGORIA_STD].dropna().unique()
+                 knowledge['subcategorias_por_cat'][cat] = sorted([s for s in subcats if s])
+
+            # Comercios generales por categoría
+            knowledge['comercios_por_cat'][cat] = []
+            knowledge['subcat_por_comercio_y_cat'][cat] = {} # Inicializar dict para esta categoría
+            if has_comercio:
+                 comers = df_cat[COMERCIO_STD].dropna().unique()
+                 knowledge['comercios_por_cat'][cat] = sorted([c for c in comers if c and c != 'n/a'])
+
+                 # Nuevo: Calcular subcategoría única o más común por comercio DENTRO de esta categoría
+                 if has_subcat:
+                     for comercio in knowledge['comercios_por_cat'][cat]:
+                         # Filtrar filas para este comercio y categoría, con subcategoría válida
+                         df_comercio_cat = df_cat[
+                             (df_cat[COMERCIO_STD] == comercio) &
+                             (df_cat[SUBCATEGORIA_STD].notna()) &
+                             (df_cat[SUBCATEGORIA_STD] != '')
+                         ]
+                         if not df_comercio_cat.empty:
+                             unique_subcats = df_comercio_cat[SUBCATEGORIA_STD].unique()
+                             if len(unique_subcats) == 1:
+                                 # Si solo hay una subcategoría para este comercio en esta categoría, la guardamos
+                                 knowledge['subcat_por_comercio_y_cat'][cat][comercio] = unique_subcats[0]
+                             # Opcional: Podrías guardar la más frecuente si no es única
+                             # else:
+                             #     most_common_subcat = Counter(df_comercio_cat[SUBCATEGORIA_STD]).most_common(1)[0][0]
+                             #     knowledge['subcat_por_comercio_y_cat'][cat][comercio] = most_common_subcat + " (más común)"
+
+    except Exception as e_kg: st.error(f"Error extrayendo conocimiento detallado: {e_kg}")
     return knowledge
 
+# --- train_classifier_std (sin cambios) ---
 @st.cache_resource
 def train_classifier_std(df_std):
     report = "Modelo no entrenado."; model = None; vectorizer = None
@@ -164,6 +222,7 @@ def train_classifier_std(df_std):
     except Exception as e: report = f"Error entrenamiento: {e}"; model, vectorizer = None, None
     return model, vectorizer, report
 
+# --- standardize_data_with_mapping (sin cambios) ---
 def standardize_data_with_mapping(df_raw, mapping):
     try:
         df_std = pd.DataFrame(); df = df_raw.copy()
@@ -227,12 +286,41 @@ def standardize_data_with_mapping(df_raw, mapping):
         df_std = df_std[df_std[TEXTO_MODELO] != '']
         return df_std
     except Exception as e: st.error(f"Error Gral aplicando mapeo '{mapping.get('bank_name', '?')}': {e}"); st.error(traceback.format_exc()); return None
+
+# **** NUEVA Función para parsear BD Acumulada ****
+def parse_accumulated_db_for_training(df_db):
+    if not isinstance(df_db, pd.DataFrame) or df_db.empty: st.error("BD Acumulada vacía."); return None
+    df_db.columns = [str(col).upper().strip() for col in df_db.columns] # Limpiar columnas al cargar
+    category_col_to_use = None
+    if CATEGORIA_STD in df_db.columns: category_col_to_use = CATEGORIA_STD
+    elif CATEGORIA_PREDICHA in df_db.columns: category_col_to_use = CATEGORIA_PREDICHA
+    else: st.error("BD Acumulada no tiene 'CATEGORIA_STD' ni 'CATEGORIA_PREDICHA'."); return None
+    required_for_train = [CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD, category_col_to_use]
+    if COMERCIO_STD not in df_db.columns: df_db[COMERCIO_STD] = ''
+    missing_cols = [col for col in required_for_train if col not in df_db.columns]
+    if missing_cols: st.error(f"BD Acumulada incompleta. Faltan: {missing_cols}"); return None
+    df_train_ready = df_db.copy()
+    try:
+        df_train_ready[CONCEPTO_STD] = df_train_ready[CONCEPTO_STD].fillna('').astype(str).str.lower().str.strip()
+        df_train_ready[COMERCIO_STD] = df_train_ready[COMERCIO_STD].fillna('').astype(str).str.lower().str.strip()
+        df_train_ready[category_col_to_use] = df_train_ready[category_col_to_use].fillna('').astype(str).str.lower().str.strip()
+        df_train_ready[IMPORTE_STD] = pd.to_numeric(df_train_ready[IMPORTE_STD], errors='coerce')
+    except Exception as e_clean: st.error(f"Error limpiando BD: {e_clean}"); return None
+    if TEXTO_MODELO not in df_train_ready.columns:
+        df_train_ready[TEXTO_MODELO] = (df_train_ready[CONCEPTO_STD] + ' ' + df_train_ready[COMERCIO_STD]).str.strip()
+    if category_col_to_use == CATEGORIA_PREDICHA:
+        df_train_ready = df_train_ready.rename(columns={CATEGORIA_PREDICHA: CATEGORIA_STD})
+        if SUBCATEGORIA_STD not in df_train_ready.columns: df_train_ready[SUBCATEGORIA_STD] = ''
+    df_train_ready = df_train_ready.dropna(subset=[IMPORTE_STD, CATEGORIA_STD, TEXTO_MODELO])
+    df_train_ready = df_train_ready[df_train_ready[CATEGORIA_STD] != ''][df_train_ready[TEXTO_MODELO] != '']
+    if df_train_ready.empty: st.warning("BD Acumulada sin filas válidas para entrenar."); return None
+    return df_train_ready
 # ------------------------------------------------------------------------------------
 
 # --- Streamlit UI ---
 st.set_page_config(layout="wide")
-st.title("🏦 Categorizador Bancario Multi-Formato v4")
-st.caption(f"Archivo de Configuración: `{CONFIG_FILENAME}`, Archivo de Base de Datos: `{DB_FILENAME}`")
+st.title("🏦 Categorizador Bancario Multi-Formato v4.1")
+st.caption(f"Archivo Config: `{CONFIG_FILENAME}`, Archivo BD: `{DB_FILENAME}`")
 
 # --- Carga Base de Datos Acumulada (Sidebar) ---
 st.sidebar.header("Base de Datos Acumulada")
@@ -247,90 +335,112 @@ if uploaded_db_file:
         st.sidebar.info("Cargando base de datos...")
         df_db_loaded, _ = read_uploaded_file(uploaded_db_file)
         if df_db_loaded is not None:
-            expected_db_cols = [CATEGORIA_PREDICHA, CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
+            # Limpiar columnas y renombrar CATEGORIA si es necesario
+            df_db_loaded.columns = [str(col).upper().strip() for col in df_db_loaded.columns]
+            if 'CATEGORIA' in df_db_loaded.columns and CATEGORIA_PREDICHA not in df_db_loaded.columns:
+                 df_db_loaded = df_db_loaded.rename(columns={'CATEGORIA': CATEGORIA_PREDICHA})
+            elif 'CATEGORÍA' in df_db_loaded.columns and CATEGORIA_PREDICHA not in df_db_loaded.columns:
+                 df_db_loaded = df_db_loaded.rename(columns={'CATEGORÍA': CATEGORIA_PREDICHA})
+
+            # Verificar columnas mínimas para que la BD sea útil
+            expected_db_cols = [CONCEPTO_STD, IMPORTE_STD, AÑO_STD, MES_STD, DIA_STD]
+            if CATEGORIA_PREDICHA in df_db_loaded.columns: expected_db_cols.append(CATEGORIA_PREDICHA)
+            elif CATEGORIA_STD in df_db_loaded.columns: expected_db_cols.append(CATEGORIA_STD)
+            else: expected_db_cols.append("CATEGORIA_X") # Añadir una que seguramente faltará
+
             missing_db_cols = [col for col in expected_db_cols if col not in df_db_loaded.columns]
+
             if not missing_db_cols:
                 st.session_state.accumulated_data = df_db_loaded
                 st.session_state[db_uploader_key] = uploaded_db_file.file_id
-                st.sidebar.success(f"Base de datos cargada ({len(df_db_loaded)} filas).")
+                st.sidebar.success(f"BD cargada ({len(df_db_loaded)} filas).")
+                # Intentar extraer conocimiento si no se cargó config
+                if not st.session_state.knowledge_loaded:
+                     # Necesitamos asegurar que la columna de categoría es CATEGORIA_STD para extract_knowledge
+                     df_for_knowledge = df_db_loaded.copy()
+                     if CATEGORIA_PREDICHA in df_for_knowledge.columns and CATEGORIA_STD not in df_for_knowledge.columns:
+                         df_for_knowledge = df_for_knowledge.rename(columns={CATEGORIA_PREDICHA: CATEGORIA_STD})
+                     # Añadir SUBCATEGORIA_STD si falta
+                     if SUBCATEGORIA_STD not in df_for_knowledge.columns: df_for_knowledge[SUBCATEGORIA_STD] = ''
+
+                     if CATEGORIA_STD in df_for_knowledge.columns:
+                          st.session_state.learned_knowledge = extract_knowledge_std(df_for_knowledge)
+                          st.session_state.knowledge_loaded = bool(st.session_state.learned_knowledge.get('categorias'))
+                          if st.session_state.knowledge_loaded: st.sidebar.info("Conocimiento extraído de BD cargada.")
+                          else: st.sidebar.warning("No se pudo extraer conocimiento de la BD cargada.")
+                     else:
+                          st.sidebar.warning("BD cargada no tiene columna de categoría estándar para extraer conocimiento.")
+
+                st.rerun()
             else:
                 st.sidebar.error(f"Archivo DB inválido. Faltan: {missing_db_cols}")
                 st.session_state[db_uploader_key] = None
         else:
-            st.sidebar.error("No se pudo leer archivo de base de datos.")
+            st.sidebar.error("No se pudo leer archivo de BD.")
             st.session_state[db_uploader_key] = None
 
 # --- Fase 1: Cargar Configuración / Entrenar Modelo Base ---
-with st.expander("Paso 1: Cargar Configuración o Entrenar Modelo Base", expanded=True):
+with st.expander("Paso 1: Cargar Configuración o Entrenar Modelo", expanded=True):
     col1a, col1b = st.columns(2)
     with col1a:
-        st.subheader("Opción A: Cargar Configuración")
-        st.write(f"Carga un archivo `{CONFIG_FILENAME}` previamente guardado (incluye mapeos y conocimiento base).")
+        st.subheader("Opción A: Cargar Configuración Completa")
+        st.write(f"Carga `{CONFIG_FILENAME}` (mapeos + conocimiento).")
         uploaded_config_file_f1 = st.file_uploader(f"Cargar '{CONFIG_FILENAME}'", type="json", key="config_loader_f1")
         if uploaded_config_file_f1:
             config_uploader_key_f1 = "config_loader_processed_id_f1"
             if uploaded_config_file_f1.file_id != st.session_state.get(config_uploader_key_f1, None):
                 try:
                     config_data = json.load(uploaded_config_file_f1)
-                    st.write("Debug: Config JSON leída en Fase 1.")
-                    is_valid_structure = True; error_msg = ""
-                    if not isinstance(config_data, dict): is_valid_structure = False; error_msg = "No es dict JSON."
-                    else:
-                        if 'bank_mappings' not in config_data or not isinstance(config_data['bank_mappings'], dict): is_valid_structure = False; error_msg += " Falta/Inválido 'bank_mappings'."
-                        if 'learned_knowledge' not in config_data or not isinstance(config_data['learned_knowledge'], dict): is_valid_structure = False; error_msg += " Falta/Inválido 'learned_knowledge'."
-                        elif not all(k in config_data['learned_knowledge'] for k in ['categorias', 'subcategorias', 'comercios']): is_valid_structure = False; error_msg += " Faltan claves en 'learned_knowledge'."
-                    if is_valid_structure:
+                    is_valid = True; error_msg = ""
+                    if not isinstance(config_data, dict): is_valid = False; error_msg = "No es dict."
+                    elif 'bank_mappings' not in config_data or not isinstance(config_data['bank_mappings'], dict): is_valid = False; error_msg += " Falta/Inválido 'bank_mappings'."
+                    elif 'learned_knowledge' not in config_data or not isinstance(config_data['learned_knowledge'], dict): is_valid = False; error_msg += " Falta/Inválido 'learned_knowledge'."
+                    elif not all(k in config_data['learned_knowledge'] for k in ['categorias', 'subcategorias_por_cat', 'comercios_por_cat', 'subcat_por_comercio_y_cat']): is_valid = False; error_msg += " Faltan claves en 'learned_knowledge'."
+                    if is_valid:
                         st.session_state.bank_mappings = config_data['bank_mappings']
                         st.session_state.learned_knowledge = config_data['learned_knowledge']
                         st.session_state.knowledge_loaded = bool(st.session_state.learned_knowledge.get('categorias'))
                         st.success(f"Configuración completa cargada.")
                         st.sidebar.success("Config. Cargada")
                         st.session_state[config_uploader_key_f1] = uploaded_config_file_f1.file_id
-                        if not st.session_state.model_trained: st.info("Conocimiento base cargado. Modelo se entrenará si es necesario.")
-                        st.rerun() # Recargar para reflejar estado
+                        if not st.session_state.model_trained: st.info("Conocimiento cargado. Entrena el modelo si quieres categorizar.")
+                        st.rerun()
                     else: st.error(f"Error formato config: {error_msg.strip()}"); st.session_state[config_uploader_key_f1] = None
-                except json.JSONDecodeError: st.error("Error leyendo JSON."); st.session_state[config_uploader_key_f1] = None
                 except Exception as e_load: st.error(f"Error cargando config: {e_load}"); st.error(traceback.format_exc()); st.session_state[config_uploader_key_f1] = None
 
     with col1b:
-        st.subheader("Opción B: (Re)Entrenar Modelo")
-        st.write("Sube tu archivo histórico (CSV o Excel) con categorías asignadas.")
-        uploaded_historic_file_f1b = st.file_uploader(
-            "Cargar Archivo Histórico (.csv, .xlsx, .xls)",
-            type=["csv", "xlsx", "xls"],
-            key="historic_uploader_f1b"
-        )
-        if uploaded_historic_file_f1b:
-            if st.button("🧠 Entrenar/Reentrenar Modelo", key="train_historic_f1b"):
-                with st.spinner("Procesando y entrenando..."):
-                    df_raw_hist, _ = read_uploaded_file(uploaded_historic_file_f1b)
-                    if df_raw_hist is not None:
-                        df_std_hist = parse_historic_categorized(df_raw_hist.copy())
-                        if df_std_hist is not None and not df_std_hist.empty:
-                            st.success("Archivo histórico parseado.")
-                            st.session_state.learned_knowledge = extract_knowledge_std(df_std_hist)
-                            st.session_state.knowledge_loaded = True
-                            st.sidebar.success("Conocimiento Base Extraído/Actualizado")
-                            with st.sidebar.expander("Categorías Aprendidas"): st.write(st.session_state.learned_knowledge['categorias'])
-                            model, vectorizer, report = train_classifier_std(df_std_hist)
-                            if model and vectorizer:
-                                st.session_state.model = model; st.session_state.vectorizer = vectorizer
-                                st.session_state.model_trained = True; st.session_state.training_report = report
-                                st.success("¡Modelo (re)entrenado exitosamente!")
-                                st.sidebar.subheader("Evaluación Modelo")
-                                with st.sidebar.expander("Ver Informe"): st.text(st.session_state.training_report)
-                            else:
-                                st.error("Fallo en entrenamiento."); st.session_state.model_trained = False
-                                st.session_state.training_report = report; st.sidebar.error("Entrenamiento Fallido")
-                                st.sidebar.text(st.session_state.training_report)
-                        else: st.error("No se pudo parsear histórico."); st.session_state.model_trained = False
-                    else: st.error("No se pudo leer archivo histórico."); st.session_state.model_trained = False
+        st.subheader("Opción B: (Re)Entrenar Modelo desde BD")
+        st.write("Entrena el modelo usando los datos de la BD Acumulada (cargada en sidebar).")
+        if st.session_state.accumulated_data.empty:
+            st.warning("BD Acumulada está vacía. Cárgala o añade datos categorizando.")
+        elif st.button("🧠 Entrenar/Reentrenar Modelo con BD Actual", key="train_db_f1b"):
+             with st.spinner("Preparando BD y entrenando..."):
+                df_train_ready = parse_accumulated_db_for_training(st.session_state.accumulated_data.copy())
+                if df_train_ready is not None and not df_train_ready.empty:
+                    st.success("Datos de BD preparados.")
+                    # Actualizar conocimiento desde la BD
+                    st.session_state.learned_knowledge = extract_knowledge_std(df_train_ready)
+                    st.session_state.knowledge_loaded = True
+                    st.sidebar.success("Conocimiento Actualizado (BD)")
+                    with st.sidebar.expander("Categorías (BD)"): st.write(st.session_state.learned_knowledge['categorias'])
+                    # Entrenar
+                    model, vectorizer, report = train_classifier_std(df_train_ready)
+                    if model and vectorizer:
+                        st.session_state.model = model; st.session_state.vectorizer = vectorizer
+                        st.session_state.model_trained = True; st.session_state.training_report = report
+                        st.success("¡Modelo (re)entrenado con BD!"); st.sidebar.subheader("Evaluación Modelo");
+                        with st.sidebar.expander("Ver Informe"): st.text(st.session_state.training_report)
+                    else:
+                        st.error("Fallo entrenamiento con BD."); st.session_state.model_trained = False
+                        st.session_state.training_report = report; st.sidebar.error("Entrenamiento Fallido")
+                        st.sidebar.text(st.session_state.training_report)
+                else: st.error("No se pudieron preparar datos de BD para entrenar."); st.session_state.model_trained = False
 
-# --- Fase 2: Aprendizaje de Formatos Bancarios y Guardar Configuración ---
+# --- Fase 2: Formatos Bancarios y Guardar Configuración ---
 with st.expander("Paso 2: Definir Formatos Bancarios y Guardar Configuración"):
+    # ... (UI sin cambios, pero ahora descarga mapeos + learned_knowledge) ...
     st.write("Aquí puedes enseñar a la aplicación cómo leer archivos de diferentes bancos (CSV/Excel) o ver/editar mapeos existentes.")
     st.info("Los cambios se guardan en memoria. Usa el botón al final para descargar la configuración completa (mapeos + conocimiento base).")
-
     st.subheader("Aprender/Editar Formato de Banco")
     bank_options = ["SANTANDER", "EVO", "WIZINK", "AMEX"]
     selected_bank_learn = st.selectbox("Selecciona Banco:", bank_options, key="bank_learn_f2_select")
@@ -365,7 +475,6 @@ with st.expander("Paso 2: Definir Formatos Bancarios y Guardar Configuración"):
             st.markdown("**Importe:**")
             val_map_decimal_sep = st.text_input("Separador Decimal", value=saved_mapping.get('decimal_sep', ','), key=f"map_decimal_{selected_bank_learn}")
             val_map_thousands_sep = st.text_input("Separador Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
-
             if st.button(f"💾 Guardar Mapeo para {selected_bank_learn}", key="save_mapping_f2"):
                 final_mapping_cols = {}
                 if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto
@@ -382,22 +491,20 @@ with st.expander("Paso 2: Definir Formatos Bancarios y Guardar Configuración"):
                     if not final_mapping_cols.get(FECHA_STD): st.error("Mapea FECHA."); valid=False
                     elif not current_fmt: st.error("Especifica formato."); valid=False
                 else:
-                    if not all(final_mapping_cols.get(d) for d in [AÑO_STD,MES_STD,DIA_STD]): st.error("Mapea AÑO, MES, DIA."); valid=False
+                    if not all(final_mapping_cols.get(d) for d in [AÑO_STD,MES_STD,DIA_STD]): st.error("Mapea AÑO, MES y DIA."); valid=False
                 if valid:
                     mapping_to_save = {'bank_name': selected_bank_learn, 'columns': final_mapping_cols, 'decimal_sep': val_map_decimal_sep.strip(), 'thousands_sep': val_map_thousands_sep.strip() or None}
                     if map_single_date and current_fmt: mapping_to_save['date_format'] = current_fmt.strip()
                     st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
-                    st.success(f"Mapeo {selected_bank_learn} guardado!"); st.rerun()
+                    st.success(f"¡Mapeo {selected_bank_learn} guardado!"); st.rerun()
                 else: st.warning("Revisa errores.")
-
     st.divider()
     st.subheader("Descargar Configuración Completa (Mapeos + Conocimiento)")
-    # **** UNIFICACIÓN: Descargar ambos ****
     if st.session_state.bank_mappings or st.session_state.learned_knowledge.get('categorias'):
         try:
             config_to_save = {
                 'bank_mappings': st.session_state.get('bank_mappings', {}),
-                'learned_knowledge': st.session_state.get('learned_knowledge', {'categorias': [], 'subcategorias': {}, 'comercios': {}})
+                'learned_knowledge': st.session_state.get('learned_knowledge', {'categorias': [], 'subcategorias_por_cat': {}, 'comercios_por_cat': {}, 'subcat_por_comercio_y_cat': {}})
             }
             config_json_str = json.dumps(config_to_save, indent=4, ensure_ascii=False)
             st.download_button(label=f"💾 Descargar '{CONFIG_FILENAME}'", data=config_json_str.encode('utf-8'), file_name=CONFIG_FILENAME, mime='application/json', key='download_config_f2')
@@ -405,21 +512,18 @@ with st.expander("Paso 2: Definir Formatos Bancarios y Guardar Configuración"):
     else: st.info("No hay mapeos ni conocimiento base para guardar.")
 
 # --- Fase 3: Categorización ---
-with st.expander("Paso 3: Categorizar Nuevos Archivos", expanded=True):
-    model_ready_for_pred = st.session_state.get('model_trained', False) # El *objeto* modelo debe estar en memoria
+with st.expander("Paso 3: Categorizar Nuevos Archivos y Añadir a BD", expanded=True):
+    model_ready_for_pred = st.session_state.get('model_trained', False)
     mappings_available = bool(st.session_state.get('bank_mappings', {}))
-    knowledge_ready = st.session_state.get('knowledge_loaded', False) # Indica si hay categorías aprendidas/cargadas
+    knowledge_ready = st.session_state.get('knowledge_loaded', False)
 
-    if not knowledge_ready: # Cambiado: Necesitamos al menos el conocimiento para empezar
-        st.warning("⚠️ Conocimiento base no aprendido o cargado (Ver Paso 1).")
-    elif not mappings_available:
-        st.warning("⚠️ No se han aprendido o cargado formatos bancarios (Ver Paso 2).")
+    if not knowledge_ready: st.warning("⚠️ Conocimiento base no aprendido o cargado (Ver Paso 1).")
+    elif not mappings_available: st.warning("⚠️ No se han aprendido o cargado formatos bancarios (Ver Paso 2).")
     elif not model_ready_for_pred:
-        # Este caso ocurre si se cargó config pero no se entrenó el modelo en *esta sesión*
-        st.warning("⚠️ Conocimiento cargado, pero modelo no entrenado en esta sesión.")
-        st.info("Ve al Paso 1 (Opción B) y entrena el modelo usando un archivo histórico antes de categorizar.")
+        st.warning("⚠️ Modelo no entrenado en esta sesión.")
+        st.info("Ve al Paso 1 (Opción B) y entrena el modelo usando la BD Acumulada antes de categorizar.")
     else: # Modelo entrenado Y Mapeos disponibles
-        st.write("Selecciona el banco y sube el archivo **sin categorizar** (CSV o Excel) que deseas procesar.")
+        st.write("Selecciona el banco y sube el archivo **sin categorizar** (CSV o Excel).")
         available_banks_for_pred = list(st.session_state.bank_mappings.keys())
         selected_bank_predict = st.selectbox("Banco del Nuevo Archivo:", available_banks_for_pred, key="bank_predict_f3")
         uploaded_final_file = st.file_uploader(
@@ -429,29 +533,68 @@ with st.expander("Paso 3: Categorizar Nuevos Archivos", expanded=True):
         )
         if uploaded_final_file and selected_bank_predict:
             mapping_to_use = st.session_state.bank_mappings.get(selected_bank_predict)
-            if not mapping_to_use: st.error(f"Error interno: No se encontró el mapeo para {selected_bank_predict}.")
+            if not mapping_to_use: st.error(f"Error interno: No mapeo para {selected_bank_predict}.")
             else:
                  st.write(f"Procesando '{uploaded_final_file.name}'...")
                  df_std_new = None
-                 with st.spinner(f"Estandarizando datos..."):
+                 with st.spinner(f"Estandarizando..."):
                       df_raw_new, _ = read_uploaded_file(uploaded_final_file)
                       if df_raw_new is not None: df_std_new = standardize_data_with_mapping(df_raw_new.copy(), mapping_to_use)
                       else: st.error(f"No se pudo leer: {uploaded_final_file.name}")
                  if df_std_new is not None and not df_std_new.empty:
                       st.success("Datos estandarizados.")
-                      with st.spinner("Aplicando modelo..."):
+                      with st.spinner("Categorizando..."):
                           try:
-                               if TEXTO_MODELO not in df_std_new.columns: st.error(f"Error: Falta {TEXTO_MODELO} tras estandarizar.")
+                               if TEXTO_MODELO not in df_std_new.columns: st.error(f"Error: Falta {TEXTO_MODELO}.")
                                else:
                                     df_pred = df_std_new.dropna(subset=[TEXTO_MODELO]).copy()
                                     if not df_pred.empty:
+                                         # --- Predicción Categoría Principal ---
                                          X_new_vec = st.session_state.vectorizer.transform(df_pred[TEXTO_MODELO])
-                                         predictions = st.session_state.model.predict(X_new_vec)
-                                         capitalized_predictions = [str(p).capitalize() for p in predictions]
-                                         df_pred[CATEGORIA_PREDICHA] = capitalized_predictions
+                                         predictions_cat = st.session_state.model.predict(X_new_vec)
+                                         df_pred[CATEGORIA_PREDICHA] = [str(p).capitalize() for p in predictions_cat]
+
+                                         # --- Predicción/Asignación Comercio y Subcategoría ---
+                                         pred_comercios = []
+                                         pred_subcats = []
+                                         knowledge = st.session_state.learned_knowledge # Acceder al conocimiento
+                                         for index, row in df_pred.iterrows():
+                                             pred_cat = row[CATEGORIA_PREDICHA].lower() # Usar la categoría predicha (en minúsculas)
+                                             input_comercio = row.get(COMERCIO_STD, '') # Comercio estandarizado del input
+
+                                             # 1. Comercio Predicho/Estandarizado
+                                             known_comers_for_cat = knowledge['comercios_por_cat'].get(pred_cat, [])
+                                             comercio_final = input_comercio # Default al input
+                                             if input_comercio and input_comercio in known_comers_for_cat:
+                                                 comercio_final = input_comercio # Usar el nombre conocido si hay match exacto
+                                             pred_comercios.append(comercio_final.capitalize()) # Capitalizar para mostrar
+
+                                             # 2. Subcategoría Predicha (Heurística)
+                                             subcat_final = '' # Default vacía
+                                             # Regla 1: Subcategoría única por comercio+categoría
+                                             if comercio_final: # Solo si tenemos un comercio final
+                                                subcat_unica = knowledge['subcat_por_comercio_y_cat'].get(pred_cat, {}).get(comercio_final.lower())
+                                                if subcat_unica:
+                                                     subcat_final = subcat_unica
+                                             # Regla 2: Única subcategoría para la categoría general
+                                             if not subcat_final: # Si la regla 1 no aplicó
+                                                 known_subcats_for_cat = knowledge['subcategorias_por_cat'].get(pred_cat, [])
+                                                 if len(known_subcats_for_cat) == 1:
+                                                     subcat_final = known_subcats_for_cat[0]
+                                             # Regla 3: Default (ya está vacía)
+
+                                             pred_subcats.append(subcat_final.capitalize()) # Capitalizar para mostrar
+
+                                         df_pred[COMERCIO_PREDICHO] = pred_comercios
+                                         df_pred[SUBCATEGORIA_PREDICHA] = pred_subcats
+                                         # --- Fin Predicción Comercio/Subcategoría ---
+
                                          # --- ACUMULACIÓN BD ---
                                          st.write("Añadiendo a base de datos...")
-                                         db_cols_to_keep = DB_STD_COLS + [c for c in df_pred.columns if c.startswith('ORIG_')]
+                                         # Asegurar que las columnas estándar existen antes de seleccionar
+                                         for col in DB_FINAL_COLS:
+                                              if col not in df_pred.columns: df_pred[col] = '' # Crear vacías si faltan
+                                         db_cols_to_keep = DB_FINAL_COLS + [c for c in df_pred.columns if c.startswith('ORIG_')]
                                          final_db_cols = [col for col in db_cols_to_keep if col in df_pred.columns]
                                          df_to_append = df_pred[final_db_cols].copy()
                                          if 'accumulated_data' not in st.session_state or st.session_state.accumulated_data.empty:
@@ -460,11 +603,16 @@ with st.expander("Paso 3: Categorizar Nuevos Archivos", expanded=True):
                                              current_db = st.session_state.accumulated_data
                                              combined_cols = current_db.columns.union(df_to_append.columns)
                                              current_db = current_db.reindex(columns=combined_cols); df_to_append = df_to_append.reindex(columns=combined_cols)
-                                             st.session_state.accumulated_data = pd.concat([current_db, df_to_append], ignore_index=True)
+                                             st.session_state.accumulated_data = pd.concat([current_db, df_to_append], ignore_index=True).fillna('') # Rellenar NaNs por si acaso
                                          st.success(f"{len(df_to_append)} transacciones añadidas a BD.")
                                          # --- FIN ACUMULACIÓN ---
+
                                          st.subheader("📊 Resultados (este archivo)")
-                                         st.dataframe(df_pred[final_display_cols])
+                                         # Reordenar para mostrar las nuevas columnas al principio
+                                         display_cols_order = [CATEGORIA_PREDICHA, SUBCATEGORIA_PREDICHA, COMERCIO_PREDICHO] + \
+                                                              [c for c in final_display_cols if c not in [CATEGORIA_PREDICHA, SUBCATEGORIA_PREDICHA, COMERCIO_PREDICHO]]
+                                         st.dataframe(df_pred[display_cols_order])
+
                                          csv_output = df_pred.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
                                          st.download_button(label=f"📥 Descargar '{uploaded_final_file.name}' Categorizado", data=csv_output, file_name=f"categorizado_{uploaded_final_file.name}", mime='text/csv', key=f"download_final_{uploaded_final_file.name}")
                                     else: st.warning("No quedaron filas válidas para categorizar.")
@@ -473,39 +621,42 @@ with st.expander("Paso 3: Categorizar Nuevos Archivos", expanded=True):
                  elif df_std_new is not None and df_std_new.empty: st.warning("Archivo vacío o sin datos válidos tras estandarizar.")
                  else: st.error("Fallo en la estandarización usando el mapeo.")
 
-# --- Fase 4: Visualización y Descarga de Base de Datos Acumulada ---
+# --- Fase 4: Base de Datos Acumulada ---
 with st.expander("Paso 4: Ver y Descargar Base de Datos Acumulada", expanded=False):
-    # **** CORRECCIÓN: Acceder directamente a session_state ****
     db_state_f4 = st.session_state.get('accumulated_data', pd.DataFrame())
     if db_state_f4 is not None and not db_state_f4.empty:
         st.write(f"Base de datos actual en memoria ({len(db_state_f4)} filas):")
-        st.dataframe(db_state_f4.tail(10)) # Mostrar últimas 10
+        # Mostrar columnas relevantes de la BD final
+        cols_to_show_db = [col for col in DB_FINAL_COLS if col in db_state_f4.columns]
+        st.dataframe(db_state_f4[cols_to_show_db]) # Mostrar todas las filas con columnas seleccionadas
 
         st.subheader(f"Descargar Base de Datos Completa")
-        try:
-            db_csv_output = db_state_f4.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
-            st.download_button(label=f"💾 Descargar '{DB_FILENAME}' (CSV)", data=db_csv_output, file_name=DB_FILENAME, mime='text/csv', key='download_db_csv_f4')
-        except Exception as e_db_csv: st.error(f"Error generando CSV BD: {e_db_csv}")
-        try:
-            output_excel = io.BytesIO()
-            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer: db_state_f4.to_excel(writer, index=False, sheet_name='Gastos')
-            excel_data = output_excel.getvalue(); db_excel_filename = DB_FILENAME.replace('.csv', '.xlsx')
-            st.download_button(label=f"💾 Descargar '{db_excel_filename}' (Excel)", data=excel_data, file_name=db_excel_filename, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key='download_db_excel_f4')
-        except Exception as e_db_xlsx: st.error(f"Error generando Excel BD: {e_db_xlsx}")
+        col_db1, col_db2 = st.columns(2)
+        with col_db1:
+            try:
+                db_csv_output = db_state_f4.to_csv(index=False, sep=';', decimal=',').encode('utf-8')
+                st.download_button(label=f"💾 Descargar '{DB_FILENAME}' (CSV)", data=db_csv_output, file_name=DB_FILENAME, mime='text/csv', key='download_db_csv_f4')
+            except Exception as e_db_csv: st.error(f"Error CSV BD: {e_db_csv}")
+        with col_db2:
+            try:
+                output_excel = io.BytesIO()
+                with pd.ExcelWriter(output_excel, engine='openpyxl') as writer: db_state_f4.to_excel(writer, index=False, sheet_name='Gastos')
+                excel_data = output_excel.getvalue(); db_excel_filename = DB_FILENAME.replace('.csv', '.xlsx')
+                st.download_button(label=f"💾 Descargar '{db_excel_filename}' (Excel)", data=excel_data, file_name=db_excel_filename, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key='download_db_excel_f4')
+            except Exception as e_db_xlsx: st.error(f"Error Excel BD: {e_db_xlsx}")
     else:
-        st.info("La base de datos acumulada está vacía. Carga una existente o categoriza nuevos archivos.")
+        st.info("La base de datos acumulada está vacía. Carga una existente o añade datos categorizando.")
 
-
-# Sidebar Info y Estado (Final del script)
+# --- Sidebar Info y Estado (Final del script) ---
 st.sidebar.divider()
 st.sidebar.header("Acerca de")
-st.sidebar.info( "1. Carga Config/Entrena. 2. Define Formatos/Guarda Config. 3. Categoriza. 4. Gestiona BD Acumulada.")
+st.sidebar.info( "1. Carga Config/Entrena. 2. Define Formatos/Guarda Config. 3. Categoriza y Acumula. 4. Gestiona BD.")
 st.sidebar.divider()
 st.sidebar.subheader("Estado Actual")
 model_ready_sidebar = st.session_state.get('model_trained', False)
 knowledge_ready_sidebar = st.session_state.get('knowledge_loaded', False)
 if model_ready_sidebar: st.sidebar.success("✅ Modelo Entrenado")
-elif knowledge_ready_sidebar: st.sidebar.info("ℹ️ Conocimiento Cargado (Modelo necesita entrenamiento)")
+elif knowledge_ready_sidebar: st.sidebar.info("ℹ️ Conocimiento Cargado (Entrenar modelo si es necesario)")
 else: st.sidebar.warning("❌ Sin Modelo/Conocimiento")
 
 if st.session_state.get('bank_mappings', {}): st.sidebar.success(f"✅ Mapeos Cargados ({len(st.session_state.bank_mappings)} bancos)")
