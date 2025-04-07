@@ -439,25 +439,66 @@ with tab1:
                     st.markdown("**Importe:**"); val_map_decimal_sep = st.text_input("Separador Decimal", value=saved_mapping.get('decimal_sep', ','), key=f"map_decimal_{selected_bank_learn}")
                     val_map_thousands_sep = st.text_input("Separador Miles", value=saved_mapping.get('thousands_sep', ''), key=f"map_thousands_{selected_bank_learn}")
 
-                if st.button(f"💾 Guardar Mapeo {selected_bank_learn}", key="save_mapping_f2"):
-                    final_mapping_cols = {}; valid = True; current_fmt = map_formato_fecha
-                    if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto; else: st.error("Mapea CONCEPTO."); valid=False
-                    if map_importe: final_mapping_cols[IMPORTE_STD] = map_importe; else: st.error("Mapea IMPORTE."); valid=False
-                    if map_single_date:
-                        if map_fecha_unica: final_mapping_cols[FECHA_STD] = map_fecha_unica; else: st.error("Mapea FECHA."); valid=False
-                        if not current_fmt: st.error("Especifica formato."); valid=False
-                    else:
-                        if map_año: final_mapping_cols[AÑO_STD] = map_año; else: st.error("Mapea AÑO."); valid=False
-                        if map_mes: final_mapping_cols[MES_STD] = map_mes; else: st.error("Mapea MES."); valid=False
-                        if map_dia: final_mapping_cols[DIA_STD] = map_dia; else: st.error("Mapea DIA."); valid=False
-                    if map_comercio: final_mapping_cols[COMERCIO_STD] = map_comercio
-                    if valid:
-                        current_decimal_sep = val_map_decimal_sep; current_thousands_sep = val_map_thousands_sep
-                        mapping_to_save = {'bank_name': selected_bank_learn, 'columns': final_mapping_cols, 'decimal_sep': current_decimal_sep.strip(), 'thousands_sep': current_thousands_sep.strip() or None}
-                        if map_single_date and current_fmt: mapping_to_save['date_format'] = current_fmt.strip()
-                        st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
-                        st.success(f"¡Mapeo {selected_bank_learn} guardado!"); st.rerun()
-                    else: st.warning("Revisa errores.")
+            # --- Botón de Guardado y Lógica ---
+            if st.button(f"💾 Guardar Mapeo {selected_bank_learn}", key="save_mapping_f2"):
+                # Construir el mapeo AHORA, usando los valores actuales de los widgets
+                final_mapping_cols = {}
+                if map_concepto: final_mapping_cols[CONCEPTO_STD] = map_concepto
+                if map_importe: final_mapping_cols[IMPORTE_STD] = map_importe
+                if map_single_date and map_fecha_unica: final_mapping_cols[FECHA_STD] = map_fecha_unica
+                if not map_single_date and map_año: final_mapping_cols[AÑO_STD] = map_año
+                if not map_single_date and map_mes: final_mapping_cols[MES_STD] = map_mes
+                if not map_single_date and map_dia: final_mapping_cols[DIA_STD] = map_dia
+                if map_comercio: final_mapping_cols[COMERCIO_STD] = map_comercio
+
+                # --- Validación Corregida (Separar líneas) ---
+                valid = True
+                current_fmt = map_formato_fecha # Leer widget formato ahora
+
+                if not final_mapping_cols.get(CONCEPTO_STD):
+                    st.error("Mapea CONCEPTO_STD.") # Línea separada
+                    valid=False
+                if not final_mapping_cols.get(IMPORTE_STD):
+                    st.error("Mapea IMPORTE_STD.") # Línea separada
+                    valid=False
+                if map_single_date:
+                    if not final_mapping_cols.get(FECHA_STD):
+                        st.error("Mapea FECHA_STD.") # Línea separada
+                        valid=False
+                    # Verificar formato solo si se mapeó la columna de fecha
+                    elif not current_fmt:
+                        st.error("Especifica formato de fecha.") # Línea separada
+                        valid=False
+                else: # Validar AÑO, MES, DIA
+                    if not final_mapping_cols.get(AÑO_STD):
+                         st.error("Mapea AÑO_STD.") # Línea separada
+                         valid=False
+                    if not final_mapping_cols.get(MES_STD):
+                         st.error("Mapea MES_STD.") # Línea separada
+                         valid=False
+                    if not final_mapping_cols.get(DIA_STD):
+                         st.error("Mapea DIA_STD.") # Línea separada
+                         valid=False
+                # --- Fin Validación Corregida ---
+
+                if valid:
+                    # Construir mapping_to_save AHORA
+                    current_decimal_sep = val_map_decimal_sep # Usa la variable leída antes
+                    current_thousands_sep = val_map_thousands_sep # Usa la variable leída antes
+                    mapping_to_save = {
+                        'bank_name': selected_bank_learn,
+                        'columns': final_mapping_cols,
+                        'decimal_sep': current_decimal_sep.strip(),
+                        'thousands_sep': current_thousands_sep.strip() or None,
+                    }
+                    if map_single_date and current_fmt: # Usa valor leído
+                        mapping_to_save['date_format'] = current_fmt.strip()
+
+                    st.session_state.bank_mappings[selected_bank_learn] = mapping_to_save
+                    st.success(f"¡Mapeo para {selected_bank_learn} guardado/actualizado!")
+                    st.rerun() # Recargar para reflejar cambio en sidebar
+                else:
+                    st.warning("Revisa los errores en el mapeo antes de guardar.")
 
 # --- Tab 2: Categorización y Gestión BD ---
 with tab2:
