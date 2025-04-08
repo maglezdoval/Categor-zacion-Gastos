@@ -1283,88 +1283,150 @@ with tab2:
                                    st.text("\n".join(st.session_state.debug_predictions[:max_debug_lines]))
                                    if len(st.session_state.debug_predictions) > max_debug_lines: st.caption(f"... ({max_debug_lines} de {len(st.session_state.debug_predictions)} líneas)")
 
-                          # --- Button to Add Results to DB ---
+                                                    # --- Button to Add Results to DB ---
                           if df_pred_display is not None and not df_pred_display.empty:
                               file_identifier = uploaded_final_file.file_id if uploaded_final_file.file_id else uploaded_final_file.name
                               add_button_key = f"add_db_{file_identifier}"
-                              if st.button(f"➕ Añadir {len(df_pred_display)} Resultados a BD", key=add_button_key):
+                              if st.button(f"➕ Añadir {len(df_pred_display)} Resultados a BD (Evitando Duplicados)", key=add_button_key, help="Añade SOLO las filas con clave (Fecha+Importe+Concepto+Cuenta) NUEVA a la BD en memoria."):
 
                                   # Use the *parsed* accumulated data from session state
                                   current_db = st.session_state.get('accumulated_data', pd.DataFrame())
                                   df_to_append_raw = df_pred_display.copy()
 
-                                  # Define columns to keep when appending
-                                  db_cols_to_keep = list(DB_FINAL_COLS)
+                                  # --- Define Columns to Keep When Appending ---
+                                  # Ensure we have the necessary columns for comparison and appending
+                                  db_cols_to_keep = list(DB_FINAL_COLS) # Base columns (_PREDICHA, CONCEPT_STD, etc.)
                                   if CUENTA_COL_STD in df_to_append_raw.columns:
                                        if CUENTA_COL_STD not in db_cols_to_keep: db_cols_to_keep.append(CUENTA_COL_STD)
                                   orig_cols_to_add = [c for c in df_to_append_raw.columns if c.startswith('ORIG_')]
                                   for col in orig_cols_to_add:
                                        if col not in db_cols_to_keep: db_cols_to_keep.append(col)
+                                  # Ensure all selected columns actually exist in the data to append
                                   final_cols_to_append = [col for col in db_cols_to_keep if col in df_to_append_raw.columns]
                                   df_to_append = df_to_append_raw[final_cols_to_append]
 
-                                  # --- Duplicate Detection ---
+                                  # --- Duplicate Detection Logic ---
                                   num_added = 0
-                                  new_transactions_only = pd.DataFrame(columns=df_to_append.columns)
+                                  new_transactions_only = pd.DataFrame(columns=df_to_append.columns) # Initialize empty with correct columns
 
                                   if current_db.empty:
-                                       st.write("BD vacía. Añadiendo todas las filas nuevas.")
+                                       st.write("BD vacía. Añadiendo todas las filas nuevas procesadas.")
                                        new_transactions_only = df_to_append
                                        num_added = len(new_transactions_only)
                                   else:
-                                       st.write("Detectando duplicados...")
+                                       st.write("Detectando duplicados basados en Fecha+Importe+Concepto+Cuenta...")
+
+                                       # --- Define Key Columns ---
                                        key_cols_base = [AÑO_STD, MES_STD, DIA_STD, IMPORTE_STD, CONCEPTO_STD]
                                        key_cols = []
                                        keys_ok = True
+
+                                       # Check base keys exist in BOTH dataframes
                                        for col in key_cols_base:
-                                           if col not in current_db.columns: st.error(f"Error Dup: Falta clave '{col}' en BD."); keys_ok = False
-                                           if col not in df_to_append.columns: st.error(f"Error Dup: Falta clave '{col}' en datos nuevos."); keys_ok = False
+                                           if col not in current_db.columns:
+                                               st.error(f"Error Duplicados: Falta columna clave '{col}' en la BD actual. No se puede comparar.")
+                                               keys_ok = False
+                                           if col not in df_to_append.columns:
+                                                st.error(f"Error Duplicados: Falta columna clave '{col}' en los datos nuevos (Error Interno). No se puede comparar.")
+                                                keys_ok = False
                                            if keys_ok: key_cols.append(col)
 
+                                       # Check and add Account column if available in both and base keys OK
                                        account_key_col_name = None
                                        if keys_ok:
                                            acc_col_db = CUENTA_COL_STD if CUENTA_COL_STD in current_db.columns else None
                                            acc_col_new = CUENTA_COL_STD if CUENTA_COL_STD in df_to_append.columns else None
-                                           if acc_col_db and acc_col_new: key_cols.append(CUENTA_COL_STD); account_key_col_name = CUENTA_COL_STD
-                                           # else: st.warning(f"'{CUENTA_COL_STD}' no usado para duplicados (falta en BD o nuevos).")
+                                           if acc_col_db and acc_col_new:
+                                               key_cols.append(CUENTA_COL_STD)
+                                               account_key_col_name = CUENTA_COL_STD
+                                               st.info(f"Usando '{CUENTA_COL_STD}' como parte de la clave de duplicados.")
+                                           elif acc_col_db and not acc_col_new:
+                                               st.warning(f"'{CUENTA_COL_STD}' existe en BD pero no en datos nuevos. No se usará en clave de duplicados.")
+                                           elif not acc_col_db and acc_col_new:
+                                               st.warning(f"'{CUENTA_COL_STD}' existe en datos nuevos pero no en BD. No se usará en clave de duplicados.")
+                                           # Else: Doesn't exist in either, do nothing.
 
-                                       if not keys_ok: num_added = -1
+                                       if not keys_ok:
+                                            num_added = -1 # Flag error due to missing essential key columns
+                                            st.error("No se pueden añadir filas por faltar columnas clave para comparación.")
                                        else:
+                                            # --- Prepare DataFrames for Merge ---
                                             try:
-                                                df1 = current_db.copy(); df2 = df_to_append.copy()
+                                                df1 = current_db.copy() # Existing DB
+                                                df2 = df_to_append.copy() # New data
+
+                                                # Clean key columns consistently in both DFs
+                                                st.write(f"Limpiando claves: {key_cols}") # DEBUG
                                                 for df_temp in [df1, df2]:
+                                                    # Round importe
                                                     df_temp[IMPORTE_STD] = pd.to_numeric(df_temp[IMPORTE_STD], errors='coerce').round(2)
-                                                    for col in [AÑO_STD, MES_STD, DIA_STD]: df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce').astype('Int64').fillna(0).astype(int)
+                                                    # Ensure date parts are int
+                                                    for col in [AÑO_STD, MES_STD, DIA_STD]:
+                                                        df_temp[col] = pd.to_numeric(df_temp[col], errors='coerce').astype('Int64').fillna(0).astype(int)
+                                                    # Clean text keys
                                                     df_temp[CONCEPTO_STD] = df_temp[CONCEPTO_STD].fillna('').astype(str).str.lower().str.strip()
-                                                    if account_key_col_name: df_temp[account_key_col_name] = df_temp[account_key_col_name].fillna('').astype(str).str.lower().str.strip()
+                                                    if account_key_col_name:
+                                                         df_temp[account_key_col_name] = df_temp[account_key_col_name].fillna('').astype(str).str.lower().str.strip()
 
-                                                df1_clean_keys = df1.dropna(subset=key_cols); df2_clean_keys = df2.dropna(subset=key_cols)
+                                                # --- Drop rows with NaNs in key columns BEFORE merging ---
+                                                initial_rows_db = len(df1)
+                                                initial_rows_new = len(df2)
+                                                df1_clean_keys = df1.dropna(subset=key_cols)
+                                                df2_clean_keys = df2.dropna(subset=key_cols)
+                                                dropped_db = initial_rows_db - len(df1_clean_keys)
+                                                dropped_new = initial_rows_new - len(df2_clean_keys)
+                                                if dropped_db > 0: st.warning(f"Se ignoraron {dropped_db} filas de la BD actual para comparación por claves inválidas.")
+                                                if dropped_new > 0: st.warning(f"Se ignoraron {dropped_new} filas de los datos nuevos para comparación por claves inválidas.")
 
-                                                if df1_clean_keys.empty: new_transactions_only = df2_clean_keys
+
+                                                # --- Perform Left Merge to find NEW rows ---
+                                                if df1_clean_keys.empty: # If DB is effectively empty after cleaning keys
+                                                     new_transactions_only = df2_clean_keys # Add all new rows with valid keys
                                                 elif not df2_clean_keys.empty:
-                                                    merged = df2_clean_keys.merge(df1_clean_keys[key_cols].drop_duplicates(), on=key_cols, how='left', indicator=True)
+                                                    # Merge new data (left) with unique keys from existing db (right)
+                                                    merged = df2_clean_keys.merge(
+                                                        df1_clean_keys[key_cols].drop_duplicates(), # Check against unique existing keys
+                                                        on=key_cols,
+                                                        how='left',
+                                                        indicator=True # Adds '_merge' column
+                                                    )
+                                                    # Keep only rows from new data that didn't find a match in existing keys
                                                     new_transactions_only = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+                                                # Else: df2_clean_keys is empty, new_transactions_only remains empty
 
                                                 num_added = len(new_transactions_only)
+                                                # Calculate duplicates based on rows in df2_clean_keys that *did* find a match
                                                 num_duplicates = len(df2_clean_keys) - num_added
-                                                num_invalid_keys_new = len(df2) - len(df2_clean_keys)
-                                                if num_duplicates > 0: st.info(f"Omitidas {num_duplicates} filas duplicadas.")
-                                                if num_invalid_keys_new > 0: st.warning(f"Omitidas {num_invalid_keys_new} filas nuevas por claves inválidas ({', '.join(key_cols)}).")
-                                            except Exception as e_dup: st.error(f"Error detectando duplicados: {e_dup}"); num_added = -1
+                                                if num_duplicates > 0:
+                                                    st.info(f"Se encontraron y omitieron {num_duplicates} filas porque ya existen en la BD con la misma clave.")
 
-                                  # --- Append Non-Duplicates ---
+                                            except KeyError as ke:
+                                                 st.error(f"Error de Clave durante detección de duplicados: {ke}. Revisa si las columnas clave existen y están limpias.")
+                                                 st.error(f"Claves usadas: {key_cols}")
+                                                 st.error(f"Columnas BD: {df1.columns.tolist() if 'df1' in locals() else 'N/A'}")
+                                                 st.error(f"Columnas Nuevas: {df2.columns.tolist() if 'df2' in locals() else 'N/A'}")
+                                                 num_added = -1 # Flag error
+                                            except Exception as e_dup:
+                                                st.error(f"Error inesperado durante la detección de duplicados: {e_dup}")
+                                                st.error(traceback.format_exc())
+                                                num_added = -1 # Flag error
+
+                                  # --- Append ONLY the new transactions ---
                                   if num_added > 0:
-                                       st.write(f"Añadiendo {num_added} nuevas transacciones...")
+                                       st.write(f"Añadiendo {num_added} transacciones NUEVAS a la Base de Datos...")
+                                       # Ensure columns match before concat
                                        combined_cols = current_db.columns.union(new_transactions_only.columns)
                                        current_db_reindexed = current_db.reindex(columns=combined_cols, fill_value='')
                                        new_transactions_reindexed = new_transactions_only.reindex(columns=combined_cols, fill_value='')
 
+                                       # Concatenate original DB with ONLY the new rows identified
                                        st.session_state.accumulated_data = pd.concat(
-                                           [current_db_reindexed, new_transactions_reindexed], ignore_index=True
-                                       )
+                                           [current_db_reindexed, new_transactions_reindexed],
+                                           ignore_index=True
+                                       ).fillna('') # Fill NaNs potentially introduced by reindexing
 
                                        # --- Re-extract Knowledge AFTER adding data ---
-                                       st.info("Actualizando conocimiento base...")
+                                       st.info("Actualizando conocimiento base con los nuevos datos...")
                                        # Use the main accumulated_data which is already parsed
                                        st.session_state.learned_knowledge = extract_knowledge_std(st.session_state.accumulated_data.copy())
                                        knowledge_ok_add = bool(st.session_state.learned_knowledge.get('categorias'))
@@ -1373,10 +1435,12 @@ with tab2:
                                        else: st.sidebar.warning("BD actualizada, pero falló re-extracción conocimiento.")
 
                                        st.success(f"¡Éxito! {num_added} transacciones NUEVAS añadidas.")
-                                       st.rerun()
-                                  elif num_added == 0: st.info("No se añadieron filas nuevas (0 únicas o todas duplicadas/inválidas).")
-                                  else: st.error("No se añadieron filas por error en duplicados.")
-
+                                       st.rerun() # Refresh UI
+                                  elif num_added == 0:
+                                       st.info("No se añadieron filas nuevas (todas las filas con claves válidas ya existían en la BD o no había filas nuevas válidas).")
+                                       # No need to rerun if nothing changed
+                                  else: # num_added == -1 (Error)
+                                       st.error("No se añadieron filas debido a un error en la detección de duplicados (ver mensajes anteriores).")
 
                      elif df_std_new is not None and df_std_new.empty: st.warning(f"Archivo '{uploaded_final_file.name}' sin filas válidas tras estandarizar.")
                      # Else: Failure handled earlier
